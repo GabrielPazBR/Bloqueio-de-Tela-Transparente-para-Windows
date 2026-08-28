@@ -1,0 +1,6 @@
+/target/
+/outputs/
+/work/
+/mempalace.yaml
+/entities.json
+*.pdb
