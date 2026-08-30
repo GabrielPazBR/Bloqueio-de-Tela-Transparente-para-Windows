@@ -15,8 +15,36 @@ fn main() {
         .set("ProductVersion", env!("CARGO_PKG_VERSION"))
         .set("ProductName", "Bloqueio Transparente")
         .set("LegalCopyright", "Feito por Gabriel Paz");
-    resource.compile().expect("falha ao incorporar o ícone");
+    if cfg!(windows) {
+        resource.compile().expect("falha ao incorporar o ícone");
+    } else {
+        compile_resource_cross_platform(&resource, &output).expect("falha ao incorporar o ícone");
+    }
     println!("cargo:rerun-if-changed=build.rs");
+}
+
+fn compile_resource_cross_platform(
+    resource: &winres::WindowsResource,
+    output: &std::path::Path,
+) -> std::io::Result<()> {
+    // O winres grava resource.rc antes de tentar localizar o rc.exe.
+    // Em builds cruzadas, o Zig compila esse arquivo para o formato MSVC.
+    let _ = resource.compile();
+    let source = output.join("resource.rc");
+    let compiled = output.join("resource.res");
+    let zig = std::env::var_os("ZIG").unwrap_or_else(|| "zig".into());
+    let status = std::process::Command::new(zig)
+        .arg("rc")
+        .arg(format!("/fo{}", compiled.display()))
+        .arg(&source)
+        .status()?;
+    if !status.success() {
+        return Err(std::io::Error::other(
+            "o compilador de recursos retornou erro",
+        ));
+    }
+    println!("cargo:rustc-link-arg={}", compiled.display());
+    Ok(())
 }
 
 fn write_icon(path: &std::path::Path) -> std::io::Result<()> {

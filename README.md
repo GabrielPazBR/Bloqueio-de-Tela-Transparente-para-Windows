@@ -1,20 +1,21 @@
 # Bloqueio Transparente
 
-Aplicativo nativo para Windows 11 x64 que bloqueia teclado e mouse sem ocultar ou congelar o conteúdo dos monitores.
+Aplicativo nativo para Windows 10 e 11 que bloqueia teclado e mouse sem ocultar ou congelar o conteúdo dos monitores.
 
 Feito por Gabriel Paz.
 
 ## Versão atual
 
-**5.0b** (`0.5.0-beta`)
-
-[Baixar o instalador para Windows 11 x64](https://github.com/GabrielPazBR/Bloqueio-de-Tela-Transparente-para-Windows/releases/download/v0.5.0-beta/BloqueioTransparente-Setup-0.5.0b.exe)
+**6.3** (`0.6.3`)
 
 ## Recursos
 
 - Bloqueio transparente em múltiplos monitores
 - Senha personalizada, inclusive vazia
+- Windows Hello como mecanismo exclusivo de desbloqueio quando ativado
+- Bloqueio automático após 1, 5, 10, 15, 30 ou 60 minutos de inatividade
 - Atalho global configurável
+- Substituição opcional de `Win + L` com recuperação pelo serviço
 - Ícone na bandeja do sistema
 - Escurecimento ajustável da tela
 - Mensagem personalizada na tela de desbloqueio
@@ -27,7 +28,8 @@ Feito por Gabriel Paz.
 
 ## Requisitos
 
-- Windows 11 x64
+- Windows 10 de 32 bits: instalador x86
+- Windows 10 ou 11 de 64 bits: instalador x64
 - Permissão de administrador para instalar o serviço
 
 ## Instalação
@@ -42,7 +44,7 @@ Na primeira execução:
 
 Após a instalação, o aplicativo será iniciado automaticamente com o Windows. Ao abrir o instalador novamente, será possível abrir as configurações, atualizar ou desinstalar a versão existente.
 
-Para atualizar uma instalação anterior, abra o instalador 5.0b e escolha **Atualizar**.
+Para atualizar uma instalação anterior, abra o instalador 6.3 da mesma arquitetura e escolha **Atualizar**.
 
 ## Uso
 
@@ -61,16 +63,85 @@ BloqueioTransparente.exe status
 BloqueioTransparente.exe uninstall
 ```
 
-Durante o bloqueio, a primeira tecla imprimível abre o campo de senha e já é incluída na entrada. A tecla `Escape` oculta o campo sem desbloquear.
+Com o Windows Hello desativado, a primeira tecla imprimível abre o campo de senha e já é incluída na entrada. A tecla `Escape` oculta o campo sem desbloquear.
 
-## Alterações da versão 5.0b
+Com o Windows Hello ativado, mover o mouse ou pressionar uma tecla abre a confirmação nativa do Windows. O teclado e o leitor biométrico ficam livres enquanto essa confirmação estiver aberta. A senha do app não é aceita para desbloquear, mas continua protegendo as configurações.
 
-- Integração com Windows Hello suspensa.
+Se a janela de senha ou a confirmação do Windows Hello ficar 15 segundos sem atividade, ela será fechada sem desbloquear a tela. Uma nova entrada abre a confirmação novamente.
+
+## Alterações da versão 6.3
+
+- O controle do widget agora representa transparência: 0% mantém as letras brancas e 100% deixa o widget invisível.
+- O texto do controle foi alterado de **Opacidade** para **Transparência**.
+- Novas configurações usam 0% de transparência por padrão.
+
+## Alterações da versão 6.2
+
+- Fechamento automático da janela de senha após 15 segundos sem atividade.
+- Cancelamento da confirmação do Windows Hello após o mesmo período.
+- A tela permanece bloqueada e volta a exibir somente as coberturas transparentes.
+
+## Alterações da versão 6.1
+
+- Opção **Encerrar aplicativo** no menu do ícone da bandeja.
+- O encerramento para o serviço, o agente e as demais instâncias do executável instalado.
+- A configuração de `Win + L` é restaurada antes do encerramento.
+- O pedido de encerramento só é aceito quando enviado pelo agente iniciado pelo serviço.
+
+## Alterações da versão 6.0
+
+- Novo instalador x86 para Windows 10 de 32 bits.
+- Instaladores separados e identificados para x86 e x64.
+- Comando `--app-architecture` para confirmar a arquitetura do executável.
+
+## Alterações da versão 5.9
+
+- Slider para regular a opacidade do widget entre 0% e 100%.
+- Remoção do fundo e do contorno retangular do relógio.
+- Escurecimento da tela em 40% por padrão para novos usuários.
+- Configurações existentes mantêm seus valores atuais.
+
+## Alterações da versão 5.8
+
+- O hook permanente de `Win + L` continua instalado durante o Windows Hello.
+- `Win + L` volta a funcionar após desbloquear e pode ser usado repetidamente.
+
+## Alterações da versão 5.7
+
+- Opção autenticada para usar `Win + L` com o bloqueio transparente.
+- O hook é confirmado antes de desativar o bloqueio nativo do Windows.
+- O valor anterior da política de bloqueio é preservado e restaurado.
+- O serviço restaura `Win + L` antes de reiniciar o agente e quando é encerrado.
+- Falhas repetidas continuam acionando o bloqueio normal do Windows.
+
+## Alterações da versão 5.6
+
+- Os hooks de teclado e mouse liberam os eventos enquanto o Windows Hello está aberto.
+- A thread de verificação do Windows Hello usa o modelo adequado para aguardar a resposta assíncrona.
+- O widget ganhou os tamanhos muito pequeno e muito grande.
+
+## Alterações da versão 5.5
+
+- A janela transparente não retoma o foco enquanto o Windows Hello está aberto.
+- O teclado permanece disponível para digitar o PIN do Windows Hello.
+- A confirmação biométrica pode concluir sem disputa de foco com a janela de bloqueio.
+
+## Alterações da versão 5.4
+
+- A confirmação do Windows Hello não interrompe mais os sinais de vida do agente.
+- O agente volta a iniciar após o desbloqueio do Windows sem desativar a proteção configurada.
+- A numeração dos instaladores voltou a avançar em 0.1 por versão.
+
+- Opção de bloqueio automático por tempo sem usar teclado ou mouse.
+- Tempo configurável em 1, 5, 10, 15, 30 ou 60 minutos, desativado por padrão.
+- Windows Hello implementado como único mecanismo de desbloqueio quando ativado.
+- Ativação condicionada à disponibilidade e a uma confirmação válida do Windows Hello.
+- Cancelamento ou falha do Windows Hello mantém a tela bloqueada e permite uma nova tentativa.
 - Substituição de `Win + L` suspensa. O atalho mantém o bloqueio normal do Windows.
-- Opções antigas dessas integrações são desativadas durante a atualização.
+- A opção antiga de substituição de `Win + L` é desativada durante a atualização.
 - Widget de data e hora redesenhado com maior destaque para a hora.
 - Data exibida em formato compacto em português.
-- Posição e tamanho configuráveis do widget preservados.
+- Posição configurável e cinco tamanhos de widget: muito pequeno, pequeno, médio, grande e muito grande.
 
 ## Testes
 
@@ -86,8 +157,8 @@ Os testes comuns não instalam hooks globais, não criam o serviço e não bloqu
 ## Limitações
 
 - `Ctrl + Alt + Del` continua sendo controlado pelo Windows.
-- `Win + L` mantém o bloqueio normal do Windows nesta versão.
-- Windows Hello não está disponível nesta versão.
+- Quando a substituição de `Win + L` está ativa, as formas normais de bloquear o Windows ficam temporariamente desativadas.
+- O Windows Hello precisa estar configurado para o usuário no Windows.
 - Um administrador local pode encerrar ou modificar o aplicativo.
 - RDP, toque, caneta e assinatura digital não fazem parte desta versão.
 - O bloqueio transparente não substitui a segurança da tela protegida do Windows.

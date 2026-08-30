@@ -4,6 +4,14 @@ pub enum FirstRunAction {
     OpenMaintenance,
 }
 
+pub const fn binary_architecture() -> &'static str {
+    #[cfg(target_pointer_width = "32")]
+    return "x86";
+
+    #[cfg(target_pointer_width = "64")]
+    return "x64";
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaintenanceAction {
     OpenSettings,

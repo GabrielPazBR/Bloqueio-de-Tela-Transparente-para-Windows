@@ -1,4 +1,4 @@
-use bloqueio_transparente::lock::{Action, Event, LockController, LockState};
+use bloqueio_transparente::lock::{Action, Event, LockController, LockState, UnlockMethod};
 use std::time::{Duration, Instant};
 
 #[test]
@@ -75,6 +75,108 @@ fn accepted_alternative_authentication_releases_a_locked_screen() {
     assert_eq!(
         actions,
         vec![Action::RemoveInputHooks, Action::HideOverlays]
+    );
+}
+
+#[test]
+fn windows_hello_is_the_only_unlock_action_when_enabled() {
+    let now = Instant::now();
+    let mut controller = LockController::new();
+    controller.set_unlock_method(UnlockMethod::WindowsHello);
+    controller.handle(Event::LockRequested, now);
+
+    let actions = controller.handle(Event::PrintableCharacter('s'), now);
+
+    assert_eq!(controller.state(), LockState::Verifying);
+    assert!(controller.password_buffer().is_empty());
+    assert_eq!(
+        actions,
+        vec![Action::ShowPasswordPrompt, Action::VerifyWindowsHello]
+    );
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, Action::VerifyPassword(_)))
+    );
+}
+
+#[test]
+fn mouse_interaction_requests_windows_hello_once() {
+    let now = Instant::now();
+    let mut controller = LockController::new();
+    controller.set_unlock_method(UnlockMethod::WindowsHello);
+    controller.handle(Event::LockRequested, now);
+
+    let first = controller.handle(Event::UserInteraction, now);
+    let duplicate = controller.handle(Event::UserInteraction, now);
+
+    assert_eq!(
+        first,
+        vec![Action::ShowPasswordPrompt, Action::VerifyWindowsHello]
+    );
+    assert!(duplicate.is_empty());
+}
+
+#[test]
+fn canceled_windows_hello_keeps_the_screen_locked_and_restores_hooks() {
+    let now = Instant::now();
+    let mut controller = LockController::new();
+    controller.set_unlock_method(UnlockMethod::WindowsHello);
+    controller.handle(Event::LockRequested, now);
+    controller.handle(Event::UserInteraction, now);
+
+    let actions = controller.handle(Event::AlternativeAuthenticationRejected, now);
+
+    assert_eq!(controller.state(), LockState::Locked);
+    assert_eq!(
+        actions,
+        vec![Action::InstallInputHooks, Action::ShowPasswordError]
+    );
+}
+
+#[test]
+fn inactive_password_prompt_closes_without_unlocking() {
+    let now = Instant::now();
+    let mut controller = LockController::new();
+    controller.handle(Event::LockRequested, now);
+    controller.handle(Event::PrintableCharacter('s'), now);
+
+    let actions = controller.handle(
+        Event::PromptInactivityElapsed,
+        now + Duration::from_secs(15),
+    );
+
+    assert_eq!(controller.state(), LockState::Locked);
+    assert!(controller.password_buffer().is_empty());
+    assert_eq!(actions, vec![Action::HidePasswordPrompt]);
+}
+
+#[test]
+fn inactive_windows_hello_is_canceled_without_unlocking() {
+    let now = Instant::now();
+    let mut controller = LockController::new();
+    controller.set_unlock_method(UnlockMethod::WindowsHello);
+    controller.handle(Event::LockRequested, now);
+    controller.handle(Event::UserInteraction, now);
+
+    let actions = controller.handle(
+        Event::PromptInactivityElapsed,
+        now + Duration::from_secs(15),
+    );
+
+    assert_eq!(controller.state(), LockState::Locked);
+    assert_eq!(
+        actions,
+        vec![
+            Action::CancelWindowsHello,
+            Action::HidePasswordPrompt,
+            Action::InstallInputHooks,
+        ]
+    );
+    assert!(
+        controller
+            .handle(Event::AlternativeAuthenticationRejected, now)
+            .is_empty()
     );
 }
 

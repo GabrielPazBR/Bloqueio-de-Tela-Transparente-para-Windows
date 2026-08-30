@@ -9,6 +9,8 @@ use tempfile::NamedTempFile;
 pub const CONFIG_VERSION: u32 = 1;
 pub const DEFAULT_UNLOCK_MESSAGE: &str = "Digite a senha para desbloquear";
 pub const MAX_UNLOCK_MESSAGE_CHARS: usize = 80;
+pub const DEFAULT_DIMMING_PERCENTAGE: u8 = 40;
+pub const IDLE_TIMEOUT_OPTIONS_MINUTES: [u16; 7] = [0, 1, 5, 10, 15, 30, 60];
 
 pub fn default_unlock_message() -> String {
     DEFAULT_UNLOCK_MESSAGE.into()
@@ -31,6 +33,12 @@ pub struct WidgetConfig {
     pub height: u32,
     pub x_percent: u8,
     pub y_percent: u8,
+    #[serde(default = "default_widget_opacity")]
+    pub opacity_percentage: u8,
+}
+
+pub const fn default_widget_opacity() -> u8 {
+    0
 }
 
 impl Default for WidgetConfig {
@@ -42,6 +50,7 @@ impl Default for WidgetConfig {
             height: 120,
             x_percent: 50,
             y_percent: 5,
+            opacity_percentage: default_widget_opacity(),
         }
     }
 }
@@ -89,6 +98,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub windows_hello_enabled: bool,
     #[serde(default)]
+    pub idle_timeout_minutes: u16,
+    #[serde(default)]
     pub win_l_enabled: bool,
     #[serde(default)]
     pub dimming_percentage: u8,
@@ -110,6 +121,7 @@ impl AppConfig {
             version: CONFIG_VERSION,
             enabled: true,
             windows_hello_enabled: false,
+            idle_timeout_minutes: 0,
             win_l_enabled: false,
             dimming_percentage: 0,
             unlock_message: default_unlock_message(),
@@ -144,6 +156,13 @@ impl From<std::io::Error> for ConfigError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnlockPasswordResult {
+    Accepted,
+    Rejected,
+    DisabledByWindowsHello,
+}
+
 #[derive(Debug, Clone)]
 pub struct ConfigStore {
     path: PathBuf,
@@ -164,8 +183,9 @@ impl ConfigStore {
             version: CONFIG_VERSION,
             enabled: true,
             windows_hello_enabled: false,
+            idle_timeout_minutes: 0,
             win_l_enabled: false,
-            dimming_percentage: 0,
+            dimming_percentage: DEFAULT_DIMMING_PERCENTAGE,
             unlock_message: default_unlock_message(),
             hide_taskbar_on_lock: false,
             widget: WidgetConfig::default(),
@@ -185,6 +205,7 @@ impl ConfigStore {
             return Err(ConfigError::UnsupportedVersion);
         }
         validate_dimming_percentage(config.dimming_percentage)?;
+        validate_idle_timeout(config.idle_timeout_minutes)?;
         validate_unlock_message(&config.unlock_message)?;
         validate_widget(&config.widget)?;
         Ok(config)
@@ -192,9 +213,8 @@ impl ConfigStore {
 
     pub fn suspend_unstable_features(&self) -> Result<bool, ConfigError> {
         let mut config = self.load()?;
-        let changed = config.windows_hello_enabled || config.win_l_enabled;
+        let changed = config.win_l_enabled;
         if changed {
-            config.windows_hello_enabled = false;
             config.win_l_enabled = false;
             self.save(&config)?;
         }
@@ -203,16 +223,48 @@ impl ConfigStore {
 
     pub fn verify_password(&self, candidate: &str) -> Result<bool, ConfigError> {
         let config = self.load()?;
-        let parsed = PasswordHash::new(&config.password_hash)
-            .map_err(|_| ConfigError::CorruptPasswordHash)?;
-        if parsed.algorithm.as_str() != "argon2id" {
-            return Err(ConfigError::CorruptPasswordHash);
+        verify_password_hash(&config.password_hash, candidate)
+    }
+
+    pub fn verify_unlock_password(
+        &self,
+        candidate: &str,
+    ) -> Result<UnlockPasswordResult, ConfigError> {
+        let config = self.load()?;
+        if config.windows_hello_enabled {
+            return Ok(UnlockPasswordResult::DisabledByWindowsHello);
         }
-        match Argon2::default().verify_password(candidate.as_bytes(), &parsed) {
-            Ok(()) => Ok(true),
-            Err(password_hash::Error::Password) => Ok(false),
-            Err(_) => Err(ConfigError::CorruptPasswordHash),
+        Ok(if verify_password_hash(&config.password_hash, candidate)? {
+            UnlockPasswordResult::Accepted
+        } else {
+            UnlockPasswordResult::Rejected
+        })
+    }
+
+    pub fn set_windows_hello_enabled(
+        &self,
+        current_password: &str,
+        enabled: bool,
+    ) -> Result<(), ConfigError> {
+        let mut config = self.load()?;
+        if !verify_password_hash(&config.password_hash, current_password)? {
+            return Err(ConfigError::AuthenticationFailed);
         }
+        config.windows_hello_enabled = enabled;
+        self.save(&config)
+    }
+
+    pub fn set_win_l_enabled(
+        &self,
+        current_password: &str,
+        enabled: bool,
+    ) -> Result<(), ConfigError> {
+        let mut config = self.load()?;
+        if !verify_password_hash(&config.password_hash, current_password)? {
+            return Err(ConfigError::AuthenticationFailed);
+        }
+        config.win_l_enabled = enabled;
+        self.save(&config)
     }
 
     pub fn change_password(
@@ -231,6 +283,7 @@ impl ConfigStore {
 
     pub fn save(&self, config: &AppConfig) -> Result<(), ConfigError> {
         validate_dimming_percentage(config.dimming_percentage)?;
+        validate_idle_timeout(config.idle_timeout_minutes)?;
         validate_unlock_message(&config.unlock_message)?;
         validate_widget(&config.widget)?;
         let parent = self.path.parent().ok_or_else(|| {
@@ -271,11 +324,26 @@ fn validate_dimming_percentage(percent: u8) -> Result<(), ConfigError> {
     }
 }
 
+pub fn valid_idle_timeout_minutes(minutes: u16) -> bool {
+    IDLE_TIMEOUT_OPTIONS_MINUTES.contains(&minutes)
+}
+
+fn validate_idle_timeout(minutes: u16) -> Result<(), ConfigError> {
+    if valid_idle_timeout_minutes(minutes) {
+        Ok(())
+    } else {
+        Err(ConfigError::InvalidConfig(
+            "tempo de inatividade inválido".into(),
+        ))
+    }
+}
+
 fn validate_widget(widget: &WidgetConfig) -> Result<(), ConfigError> {
     if (80..=1200).contains(&widget.width)
         && (40..=800).contains(&widget.height)
         && widget.x_percent <= 100
         && widget.y_percent <= 100
+        && widget.opacity_percentage <= 100
     {
         Ok(())
     } else {
@@ -299,6 +367,18 @@ fn hash_password(password: &str) -> Result<String, ConfigError> {
         .hash_password(password.as_bytes(), &salt)
         .map(|hash| hash.to_string())
         .map_err(|error| ConfigError::InvalidConfig(error.to_string()))
+}
+
+fn verify_password_hash(hash: &str, candidate: &str) -> Result<bool, ConfigError> {
+    let parsed = PasswordHash::new(hash).map_err(|_| ConfigError::CorruptPasswordHash)?;
+    if parsed.algorithm.as_str() != "argon2id" {
+        return Err(ConfigError::CorruptPasswordHash);
+    }
+    match Argon2::default().verify_password(candidate.as_bytes(), &parsed) {
+        Ok(()) => Ok(true),
+        Err(password_hash::Error::Password) => Ok(false),
+        Err(_) => Err(ConfigError::CorruptPasswordHash),
+    }
 }
 
 #[cfg(unix)]

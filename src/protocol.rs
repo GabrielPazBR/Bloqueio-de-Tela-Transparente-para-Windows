@@ -43,10 +43,14 @@ impl Drop for SecretString {
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum ClientRequest {
     Lock,
+    Shutdown,
     Status,
     Settings,
     Heartbeat {
         locked: bool,
+    },
+    ApplyWinLPolicy {
+        enabled: bool,
     },
     VerifyPassword {
         candidate: SecretString,
@@ -59,8 +63,19 @@ pub enum ClientRequest {
         current: SecretString,
         enabled: bool,
     },
+    SetWindowsHelloEnabled {
+        current: SecretString,
+        enabled: bool,
+    },
+    SetWinLEnabled {
+        current: SecretString,
+        enabled: bool,
+    },
     SetDimming {
         percent: u8,
+    },
+    SetIdleTimeout {
+        minutes: u16,
     },
     SetUnlockMessage {
         message: String,
@@ -92,6 +107,12 @@ pub enum ServiceResponse {
     },
     Settings {
         enabled: bool,
+        #[serde(default)]
+        windows_hello_enabled: bool,
+        #[serde(default)]
+        win_l_enabled: bool,
+        #[serde(default)]
+        idle_timeout_minutes: u16,
         #[serde(default)]
         dimming_percentage: u8,
         #[serde(default = "default_unlock_message")]

@@ -240,7 +240,7 @@ fn create_and_start_service(target: &std::path::Path) -> Result<()> {
 }
 
 pub fn uninstall() -> Result<()> {
-    let _ = super::agent::configure_win_l_override(false);
+    let _ = super::service::restore_win_l_for_current_user();
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .context("não foi possível abrir o Gerenciador de Serviços")?;
     let service = manager

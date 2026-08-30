@@ -5,6 +5,25 @@ pub enum TrayAction {
     Ignore,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayMenuAction {
+    Lock,
+    OpenSettings,
+    ShowStatus,
+    Shutdown,
+    Ignore,
+}
+
+pub const fn tray_menu_action(command: usize) -> TrayMenuAction {
+    match command {
+        1001 => TrayMenuAction::Lock,
+        1002 => TrayMenuAction::OpenSettings,
+        1003 => TrayMenuAction::ShowStatus,
+        1004 => TrayMenuAction::Shutdown,
+        _ => TrayMenuAction::Ignore,
+    }
+}
+
 pub fn tray_action(encoded_event: u32) -> TrayAction {
     const WM_CONTEXTMENU: u32 = 0x007B;
     const WM_LBUTTONUP: u32 = 0x0202;
@@ -34,6 +53,38 @@ pub const fn should_quit_on_window_destroy(window: isize, manager_window: isize)
 
 pub fn dimming_alpha(percent: u8) -> u8 {
     (((u16::from(percent.min(100)) * 255) + 50) / 100).max(1) as u8
+}
+
+pub fn inactivity_lock_due(
+    timeout_minutes: u16,
+    idle_duration: std::time::Duration,
+    already_locked: bool,
+) -> bool {
+    !already_locked
+        && timeout_minutes > 0
+        && idle_duration >= std::time::Duration::from_secs(u64::from(timeout_minutes) * 60)
+}
+
+pub fn should_enforce_lock_foreground(locked: bool, windows_hello_in_progress: bool) -> bool {
+    locked && !windows_hello_in_progress
+}
+
+pub fn should_block_lock_input(locked: bool, windows_hello_in_progress: bool) -> bool {
+    locked && !windows_hello_in_progress
+}
+
+pub fn should_suspend_hooks_for_windows_hello(win_l_replacement_enabled: bool) -> bool {
+    !win_l_replacement_enabled
+}
+
+pub fn should_trigger_transparent_lock(
+    replacement_enabled: bool,
+    locked: bool,
+    virtual_key: u32,
+    windows_key_down: bool,
+    key_down: bool,
+) -> bool {
+    replacement_enabled && !locked && virtual_key == 0x4c && windows_key_down && key_down
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +120,16 @@ pub struct WidgetLayout {
     pub y: i32,
     pub width: i32,
     pub height: i32,
+}
+
+pub const fn apply_widget_opacity(channel: u8, opacity_percentage: u8) -> u8 {
+    let bounded = if opacity_percentage > 100 {
+        100
+    } else {
+        opacity_percentage
+    };
+    let visibility = 100 - bounded;
+    ((channel as u16 * visibility as u16 + 50) / 100) as u8
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,5 +372,24 @@ pub fn win_l_registry_update_needed(current: Option<u32>, enabled: bool) -> bool
         (None, false) => false,
         (Some(value), expected) => value != u32::from(expected),
         (None, true) => true,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WinLRestoreAction {
+    NoChange,
+    Delete,
+    Write(u32),
+}
+
+pub fn win_l_restore_action(
+    saved_original: Option<u32>,
+    current: Option<u32>,
+) -> WinLRestoreAction {
+    match saved_original {
+        Some(2) => WinLRestoreAction::Delete,
+        Some(value) => WinLRestoreAction::Write(value),
+        None if current.is_some_and(|value| value != 0) => WinLRestoreAction::Write(0),
+        None => WinLRestoreAction::NoChange,
     }
 }

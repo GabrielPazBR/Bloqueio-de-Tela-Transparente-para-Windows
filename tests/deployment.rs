@@ -1,6 +1,6 @@
 use bloqueio_transparente::deployment::{
-    FirstRunAction, MaintenanceAction, SetupInputError, ShortcutOptions, desktop_entry,
-    first_run_action, legacy_start_menu_entry, maintenance_actions, settings_launch,
+    FirstRunAction, MaintenanceAction, SetupInputError, ShortcutOptions, binary_architecture,
+    desktop_entry, first_run_action, legacy_start_menu_entry, maintenance_actions, settings_launch,
     shortcut_entries, start_menu_entry, validate_setup_password,
 };
 use std::path::Path;
@@ -125,4 +125,13 @@ fn setup_accepts_an_empty_password_but_requires_confirmation() {
         validate_setup_password("senha", "outra"),
         Err(SetupInputError::PasswordConfirmationMismatch)
     );
+}
+
+#[test]
+fn binary_reports_the_architecture_used_for_packaging() {
+    #[cfg(target_pointer_width = "32")]
+    assert_eq!(binary_architecture(), "x86");
+
+    #[cfg(target_pointer_width = "64")]
+    assert_eq!(binary_architecture(), "x64");
 }

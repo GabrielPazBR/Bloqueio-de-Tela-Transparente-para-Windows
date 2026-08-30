@@ -1,5 +1,5 @@
 use super::{DISPLAY_NAME, ipc};
-use crate::config::Hotkey;
+use crate::config::{Hotkey, IDLE_TIMEOUT_OPTIONS_MINUTES};
 use crate::protocol::{ClientRequest, ServiceResponse};
 use crate::settings_ui::{ProtectionStatus, SettingsModel, WidgetSizePreset};
 use anyhow::{Context, Result, anyhow};
@@ -18,7 +18,7 @@ use windows::Win32::UI::Shell::{
 use windows::core::{HRESULT, w};
 use windows_sys::Win32::System::Console::GetConsoleWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    MB_ICONERROR, MB_OK, MessageBoxW, SW_HIDE, ShowWindow,
+    GetForegroundWindow, MB_ICONERROR, MB_OK, MessageBoxW, SW_HIDE, ShowWindow,
 };
 use zeroize::Zeroize;
 
@@ -128,6 +128,9 @@ fn load_model() -> Result<SettingsModel> {
         .context("não foi possível carregar as configurações")?;
     let ServiceResponse::Settings {
         enabled,
+        windows_hello_enabled,
+        win_l_enabled,
+        idle_timeout_minutes,
         dimming_percentage,
         unlock_message,
         hide_taskbar_on_lock,
@@ -151,6 +154,9 @@ fn load_model() -> Result<SettingsModel> {
     };
     Ok(SettingsModel::new(
         enabled,
+        windows_hello_enabled,
+        win_l_enabled,
+        idle_timeout_minutes,
         dimming_percentage,
         unlock_message,
         hide_taskbar_on_lock,
@@ -172,15 +178,25 @@ fn response_error(response: ServiceResponse) -> anyhow::Error {
     }
 }
 
+fn idle_timeout_label(minutes: u16) -> String {
+    match minutes {
+        0 => "Desativado".into(),
+        1 => "Após 1 minuto".into(),
+        value => format!("Após {value} minutos"),
+    }
+}
+
 struct SettingsApp {
     model: SettingsModel,
     page: Page,
     confirmation: Option<Confirmation>,
     confirmation_password: String,
     current_password: String,
+    hello_password: String,
     new_password: String,
     password_confirmation: String,
     shortcut_password: String,
+    win_l_password: String,
     shortcut: Hotkey,
     saved_dimming_percentage: u8,
     lock_texture: egui::TextureHandle,
@@ -206,9 +222,11 @@ impl SettingsApp {
             confirmation: None,
             confirmation_password: String::new(),
             current_password: String::new(),
+            hello_password: String::new(),
             new_password: String::new(),
             password_confirmation: String::new(),
             shortcut_password: String::new(),
+            win_l_password: String::new(),
             shortcut,
             saved_dimming_percentage,
             lock_texture,
@@ -236,6 +254,55 @@ impl SettingsApp {
             }
             Ok(other) => {
                 self.notify(format!("Resposta inesperada: {other:?}"), true);
+                false
+            }
+            Err(error) => {
+                self.notify(error.to_string(), true);
+                false
+            }
+        }
+    }
+
+    fn confirm_windows_hello_change(&mut self, currently_enabled: bool) -> bool {
+        if currently_enabled {
+            return true;
+        }
+        let availability = match super::windows_hello::availability() {
+            Ok(value) => value,
+            Err(error) => {
+                self.notify(error.to_string(), true);
+                return false;
+            }
+        };
+        if availability
+            != windows::Security::Credentials::UI::UserConsentVerifierAvailability::Available
+        {
+            self.notify(
+                super::windows_hello::availability_message(availability),
+                true,
+            );
+            return false;
+        }
+        let owner = unsafe { GetForegroundWindow() };
+        if owner.is_null() {
+            self.notify(
+                "Não foi possível identificar a janela de configurações.",
+                true,
+            );
+            return false;
+        }
+        match super::windows_hello::verify_for_window(
+            windows::Win32::Foundation::HWND(owner.cast()),
+            "Confirme sua identidade para ativar o Windows Hello",
+        ) {
+            Ok(result)
+                if result
+                    == windows::Security::Credentials::UI::UserConsentVerificationResult::Verified =>
+            {
+                true
+            }
+            Ok(result) => {
+                self.notify(super::windows_hello::verification_message(result), true);
                 false
             }
             Err(error) => {
@@ -320,6 +387,8 @@ impl SettingsApp {
         self.status_card(ui);
         ui.add_space(16.0);
         self.protection_card(ui);
+        ui.add_space(12.0);
+        self.inactivity_card(ui);
         ui.add_space(12.0);
         self.dimming_card(ui);
         ui.add_space(12.0);
@@ -451,12 +520,87 @@ impl SettingsApp {
         });
     }
 
+    fn inactivity_card(&mut self, ui: &mut egui::Ui) {
+        card(ui, |ui| {
+            ui.label(
+                RichText::new("Bloqueio por inatividade")
+                    .size(16.0)
+                    .strong()
+                    .color(TEXT),
+            );
+            ui.label(
+                RichText::new("Bloqueia a tela após um período sem usar teclado ou mouse.")
+                    .color(MUTED),
+            );
+            ui.add_space(14.0);
+
+            let previous = self.model.idle_timeout_minutes;
+            let mut selected = previous;
+            egui::ComboBox::from_id_salt("idle-timeout")
+                .selected_text(idle_timeout_label(selected))
+                .width(220.0)
+                .show_ui(ui, |ui| {
+                    for minutes in IDLE_TIMEOUT_OPTIONS_MINUTES {
+                        ui.selectable_value(&mut selected, minutes, idle_timeout_label(minutes));
+                    }
+                });
+
+            if selected != previous {
+                match SettingsModel::set_idle_timeout_request(selected) {
+                    Ok(request) => {
+                        if self.send(request, "Bloqueio por inatividade atualizado.") {
+                            self.model.idle_timeout_minutes = selected;
+                        }
+                    }
+                    Err(error) => self.notify(error.to_string(), true),
+                }
+            }
+        });
+    }
+
     fn password_page(&mut self, ui: &mut egui::Ui) {
         page_title(
             ui,
             "Senha",
-            "Altere a senha usada para desbloquear e proteger configurações.",
+            "Configure o desbloqueio e a senha que protege as configurações.",
         );
+        card(ui, |ui| {
+            ui.label(
+                RichText::new("Windows Hello")
+                    .size(16.0)
+                    .strong()
+                    .color(TEXT),
+            );
+            ui.label(
+                RichText::new(
+                    "Quando ativo, somente o Windows Hello desbloqueia a tela. A senha do app continua protegendo as configurações.",
+                )
+                .color(MUTED),
+            );
+            ui.add_space(12.0);
+            password_field(ui, "Senha atual do app", &mut self.hello_password);
+            ui.add_space(14.0);
+            let enabled = self.model.windows_hello_enabled;
+            let label = if enabled {
+                "Desativar Windows Hello"
+            } else {
+                "Ativar Windows Hello"
+            };
+            if primary_button(ui, label).clicked() && self.confirm_windows_hello_change(enabled) {
+                let request =
+                    SettingsModel::set_windows_hello_request(&self.hello_password, !enabled);
+                let success = if enabled {
+                    "Windows Hello desativado."
+                } else {
+                    "Windows Hello ativado como único desbloqueio."
+                };
+                if self.send(request, success) {
+                    self.model.windows_hello_enabled = !enabled;
+                    clear(&mut self.hello_password);
+                }
+            }
+        });
+        ui.add_space(16.0);
         card(ui, |ui| {
             password_field(ui, "Senha atual", &mut self.current_password);
             ui.add_space(12.0);
@@ -567,6 +711,42 @@ impl SettingsApp {
                 RichText::new(format!("Atual: {}", self.model.hotkey.display_name())).color(MUTED),
             );
         });
+        ui.add_space(16.0);
+        card(ui, |ui| {
+            ui.label(
+                RichText::new("Usar Win + L")
+                    .size(16.0)
+                    .strong()
+                    .color(TEXT),
+            );
+            ui.label(
+                RichText::new(
+                    "Substitui o bloqueio do Windows pelo bloqueio transparente. O serviço restaura o comportamento normal se o agente parar.",
+                )
+                .color(MUTED),
+            );
+            ui.add_space(12.0);
+            password_field(ui, "Senha atual", &mut self.win_l_password);
+            ui.add_space(14.0);
+            let enabled = self.model.win_l_enabled;
+            let label = if enabled {
+                "Desativar Win + L"
+            } else {
+                "Ativar Win + L"
+            };
+            if primary_button(ui, label).clicked() {
+                let request = SettingsModel::set_win_l_request(&self.win_l_password, !enabled);
+                let success = if enabled {
+                    "Win + L voltou a bloquear pelo Windows."
+                } else {
+                    "Win + L configurado para o bloqueio transparente."
+                };
+                if self.send(request, success) {
+                    self.model.win_l_enabled = !enabled;
+                    clear(&mut self.win_l_password);
+                }
+            }
+        });
     }
 
     fn about_page(&self, ui: &mut egui::Ui) {
@@ -665,6 +845,13 @@ impl SettingsApp {
                     egui::Slider::new(&mut self.model.widget.y_percent, 0..=100)
                         .suffix("%")
                         .text("Posição vertical"),
+                );
+                ui.add_space(12.0);
+                ui.label(RichText::new("Transparência").strong().color(TEXT));
+                ui.add(
+                    egui::Slider::new(&mut self.model.widget.opacity_percentage, 0..=100)
+                        .suffix("%")
+                        .text("Transparência do widget"),
                 );
             }
         });
@@ -791,9 +978,11 @@ impl Drop for SettingsApp {
     fn drop(&mut self) {
         clear(&mut self.confirmation_password);
         clear(&mut self.current_password);
+        clear(&mut self.hello_password);
         clear(&mut self.new_password);
         clear(&mut self.password_confirmation);
         clear(&mut self.shortcut_password);
+        clear(&mut self.win_l_password);
     }
 }
 

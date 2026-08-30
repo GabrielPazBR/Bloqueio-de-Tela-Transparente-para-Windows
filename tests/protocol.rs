@@ -42,6 +42,16 @@ fn codec_round_trips_a_bounded_length_prefixed_frame() {
 }
 
 #[test]
+fn shutdown_request_round_trips_through_the_control_protocol() {
+    let encoded = CommandCodec::encode_request(&ClientRequest::Shutdown).unwrap();
+
+    assert_eq!(
+        CommandCodec::decode_request(&encoded).unwrap(),
+        ClientRequest::Shutdown
+    );
+}
+
+#[test]
 fn oversized_frames_are_rejected_before_json_parsing() {
     let declared = (MAX_FRAME_BYTES as u32 + 1).to_le_bytes();
     assert_eq!(

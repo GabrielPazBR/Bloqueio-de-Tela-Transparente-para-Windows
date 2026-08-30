@@ -1,4 +1,6 @@
-use bloqueio_transparente::config::{AppConfig, ConfigError, ConfigStore, Hotkey};
+use bloqueio_transparente::config::{
+    AppConfig, ConfigError, ConfigStore, Hotkey, UnlockPasswordResult,
+};
 use std::fs;
 
 #[test]
@@ -11,7 +13,18 @@ fn existing_configuration_defaults_win_l_override_to_disabled() {
 }
 
 #[test]
-fn suspended_integrations_are_disabled_in_existing_configuration() {
+fn existing_configuration_defaults_inactivity_lock_to_disabled() {
+    let mut value = serde_json::to_value(AppConfig::for_test()).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("idle_timeout_minutes");
+    let config: AppConfig = serde_json::from_value(value).unwrap();
+    assert_eq!(config.idle_timeout_minutes, 0);
+}
+
+#[test]
+fn suspended_win_l_override_preserves_windows_hello() {
     let directory = tempfile::tempdir().unwrap();
     let store = ConfigStore::new(directory.path().join("config.json"));
     store.initialize("senha", Hotkey::default()).unwrap();
@@ -22,9 +35,52 @@ fn suspended_integrations_are_disabled_in_existing_configuration() {
 
     assert!(store.suspend_unstable_features().unwrap());
     let config = store.load().unwrap();
-    assert!(!config.windows_hello_enabled);
+    assert!(config.windows_hello_enabled);
     assert!(!config.win_l_enabled);
     assert!(!store.suspend_unstable_features().unwrap());
+}
+
+#[test]
+fn windows_hello_disables_password_only_for_unlocking() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ConfigStore::new(directory.path().join("config.json"));
+    store.initialize("senha", Hotkey::default()).unwrap();
+    let mut config = store.load().unwrap();
+    config.windows_hello_enabled = true;
+    store.save(&config).unwrap();
+
+    assert_eq!(
+        store.verify_unlock_password("senha").unwrap(),
+        UnlockPasswordResult::DisabledByWindowsHello
+    );
+    assert!(store.verify_password("senha").unwrap());
+}
+
+#[test]
+fn windows_hello_setting_requires_the_app_password() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ConfigStore::new(directory.path().join("config.json"));
+    store.initialize("senha", Hotkey::default()).unwrap();
+
+    assert_eq!(
+        store.set_windows_hello_enabled("incorreta", true),
+        Err(ConfigError::AuthenticationFailed)
+    );
+    assert!(!store.load().unwrap().windows_hello_enabled);
+
+    store.set_windows_hello_enabled("senha", true).unwrap();
+    assert!(store.load().unwrap().windows_hello_enabled);
+}
+
+#[test]
+fn win_l_replacement_setting_requires_the_app_password() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ConfigStore::new(directory.path().join("config.json"));
+    store.initialize("senha", Hotkey::default()).unwrap();
+
+    assert!(store.set_win_l_enabled("incorreta", true).is_err());
+    store.set_win_l_enabled("senha", true).unwrap();
+    assert!(store.load().unwrap().win_l_enabled);
 }
 
 #[test]
@@ -145,7 +201,17 @@ fn legacy_configuration_loads_with_new_visual_options_disabled() {
     let config = store.load().unwrap();
     assert!(!config.windows_hello_enabled);
     assert_eq!(config.dimming_percentage, 0);
+    assert_eq!(config.widget.opacity_percentage, 0);
     assert_eq!(config.unlock_message, "Digite a senha para desbloquear");
+}
+
+#[test]
+fn new_configuration_defaults_to_forty_percent_dimming() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = ConfigStore::new(temp.path().join("config.json"));
+    store.initialize("", Hotkey::default()).unwrap();
+
+    assert_eq!(store.load().unwrap().dimming_percentage, 40);
 }
 
 #[test]
@@ -201,6 +267,19 @@ fn invalid_widget_geometry_is_rejected_by_the_store() {
     let store = ConfigStore::new(temp.path().join("config.json"));
     let mut config = AppConfig::for_test();
     config.widget.width = 5000;
+    assert!(matches!(
+        store.save(&config),
+        Err(ConfigError::InvalidConfig(_))
+    ));
+}
+
+#[test]
+fn widget_opacity_above_one_hundred_is_rejected_by_the_store() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = ConfigStore::new(temp.path().join("config.json"));
+    let mut config = AppConfig::for_test();
+    config.widget.opacity_percentage = 101;
+
     assert!(matches!(
         store.save(&config),
         Err(ConfigError::InvalidConfig(_))

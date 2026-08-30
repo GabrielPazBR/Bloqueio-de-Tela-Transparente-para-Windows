@@ -5,6 +5,7 @@ mod maintenance_window;
 mod service;
 mod settings_window;
 mod setup_window;
+mod windows_hello;
 
 use anyhow::{Context, Result, bail};
 use std::env;
@@ -26,6 +27,10 @@ pub fn run() -> Result<()> {
         }
         Some("--app-version") => {
             println!(env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Some("--app-architecture") => {
+            println!("{}", crate::deployment::binary_architecture());
             Ok(())
         }
         Some("install") => install::install(),

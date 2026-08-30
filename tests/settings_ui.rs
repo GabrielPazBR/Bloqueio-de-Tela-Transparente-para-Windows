@@ -8,6 +8,9 @@ use bloqueio_transparente::settings_ui::{
 fn settings_window_represents_service_configuration_and_status() {
     let model = SettingsModel::new(
         true,
+        true,
+        false,
+        15,
         35,
         "Digite a senha".into(),
         false,
@@ -22,6 +25,8 @@ fn settings_window_represents_service_configuration_and_status() {
     );
 
     assert!(model.enabled);
+    assert!(model.windows_hello_enabled);
+    assert_eq!(model.idle_timeout_minutes, 15);
     assert_eq!(model.dimming_percentage, 35);
     assert_eq!(model.unlock_message, "Digite a senha");
     assert_eq!(model.hotkey.display_name(), "Ctrl+Shift+L");
@@ -30,8 +35,47 @@ fn settings_window_represents_service_configuration_and_status() {
 }
 
 #[test]
+fn inactivity_timeout_accepts_only_the_options_shown_by_the_app() {
+    assert_eq!(
+        SettingsModel::set_idle_timeout_request(15).unwrap(),
+        ClientRequest::SetIdleTimeout { minutes: 15 }
+    );
+    assert_eq!(
+        SettingsModel::set_idle_timeout_request(7).unwrap_err(),
+        SettingsInputError::InvalidIdleTimeout
+    );
+}
+
+#[test]
+fn windows_hello_toggle_is_authenticated_with_the_app_password() {
+    let request = SettingsModel::set_windows_hello_request("senha", true);
+    let ClientRequest::SetWindowsHelloEnabled { current, enabled } = request else {
+        panic!("comando inesperado");
+    };
+    assert_eq!(current.expose(), "senha");
+    assert!(enabled);
+}
+
+#[test]
+fn win_l_replacement_toggle_is_authenticated_with_the_app_password() {
+    let request = SettingsModel::set_win_l_request("senha", true);
+    let ClientRequest::SetWinLEnabled { current, enabled } = request else {
+        panic!("comando inesperado");
+    };
+    assert_eq!(current.expose(), "senha");
+    assert!(enabled);
+}
+
+#[test]
 fn widget_size_presets_use_friendly_stable_dimensions() {
     let mut widget = WidgetConfig::default();
+
+    WidgetSizePreset::ExtraSmall.apply(&mut widget);
+    assert_eq!((widget.width, widget.height), (160, 60));
+    assert_eq!(
+        WidgetSizePreset::from_widget(&widget),
+        Some(WidgetSizePreset::ExtraSmall)
+    );
 
     WidgetSizePreset::Small.apply(&mut widget);
     assert_eq!((widget.width, widget.height), (240, 80));
@@ -45,6 +89,9 @@ fn widget_size_presets_use_friendly_stable_dimensions() {
 
     WidgetSizePreset::Large.apply(&mut widget);
     assert_eq!((widget.width, widget.height), (640, 200));
+
+    WidgetSizePreset::ExtraLarge.apply(&mut widget);
+    assert_eq!((widget.width, widget.height), (800, 260));
 }
 
 #[test]
@@ -55,6 +102,7 @@ fn appearance_form_builds_a_visual_options_command() {
         height: 140,
         x_percent: 50,
         y_percent: 6,
+        opacity_percentage: 72,
         image_path: None,
     };
     let request = SettingsModel::set_visual_options_request(
@@ -74,6 +122,19 @@ fn appearance_form_builds_a_visual_options_command() {
     assert!(hide_taskbar_on_lock);
     assert_eq!(actual, widget);
     assert_eq!(unlock_logo_path.as_deref(), Some("C:\\logo.png"));
+}
+
+#[test]
+fn appearance_form_rejects_widget_opacity_above_one_hundred() {
+    let widget = WidgetConfig {
+        opacity_percentage: 101,
+        ..WidgetConfig::default()
+    };
+
+    assert_eq!(
+        SettingsModel::set_visual_options_request(false, widget, None).unwrap_err(),
+        SettingsInputError::InvalidWidget
+    );
 }
 
 #[test]

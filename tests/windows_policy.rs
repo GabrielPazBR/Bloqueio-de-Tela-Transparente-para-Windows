@@ -1,8 +1,9 @@
 use bloqueio_transparente::windows_policy::{
     ClockWidgetLayout, ImageLayout, KeyDecision, KeyEvent, MonitorRect, OverlayLayout, TrayAction,
-    VirtualKey, WidgetLayout, clock_date_label, dimming_alpha, should_quit_on_window_destroy,
-    tray_action, trusted_agent_process,
+    TrayMenuAction, VirtualKey, WidgetLayout, clock_date_label, dimming_alpha,
+    should_quit_on_window_destroy, tray_action, tray_menu_action, trusted_agent_process,
 };
+use std::time::Duration;
 
 #[test]
 fn tray_clicks_open_settings_or_the_context_menu() {
@@ -21,6 +22,13 @@ fn tray_event_ignores_the_icon_id_in_the_high_word() {
     let version_four_event = (1 << 16) | WM_RBUTTONUP;
 
     assert_eq!(tray_action(version_four_event), TrayAction::OpenMenu);
+}
+
+#[test]
+fn tray_exit_command_requests_a_complete_shutdown() {
+    assert_eq!(tray_menu_action(1004), TrayMenuAction::Shutdown);
+    assert_eq!(tray_menu_action(1001), TrayMenuAction::Lock);
+    assert_eq!(tray_menu_action(9999), TrayMenuAction::Ignore);
 }
 
 #[test]
@@ -87,6 +95,16 @@ fn dimming_percentage_maps_to_layered_window_alpha() {
     assert_eq!(dimming_alpha(0), 1);
     assert_eq!(dimming_alpha(50), 128);
     assert_eq!(dimming_alpha(100), 255);
+}
+
+#[test]
+fn widget_transparency_fades_a_color_channel_as_the_slider_increases() {
+    use bloqueio_transparente::windows_policy::apply_widget_opacity;
+
+    assert_eq!(apply_widget_opacity(255, 0), 255);
+    assert_eq!(apply_widget_opacity(255, 40), 153);
+    assert_eq!(apply_widget_opacity(200, 50), 100);
+    assert_eq!(apply_widget_opacity(255, 100), 0);
 }
 
 #[test]
@@ -188,4 +206,87 @@ fn matching_win_l_registry_value_does_not_require_a_write() {
     assert!(!win_l_registry_update_needed(Some(1), true));
     assert!(win_l_registry_update_needed(Some(0), true));
     assert!(!win_l_registry_update_needed(None, false));
+}
+
+#[test]
+fn inactivity_lock_is_due_only_after_the_configured_timeout() {
+    use bloqueio_transparente::windows_policy::inactivity_lock_due;
+
+    assert!(!inactivity_lock_due(0, Duration::from_secs(3_600), false));
+    assert!(!inactivity_lock_due(5, Duration::from_secs(299), false));
+    assert!(inactivity_lock_due(5, Duration::from_secs(300), false));
+    assert!(!inactivity_lock_due(5, Duration::from_secs(600), true));
+}
+
+#[test]
+fn transparent_window_does_not_reclaim_focus_during_windows_hello() {
+    use bloqueio_transparente::windows_policy::should_enforce_lock_foreground;
+
+    assert!(should_enforce_lock_foreground(true, false));
+    assert!(!should_enforce_lock_foreground(true, true));
+    assert!(!should_enforce_lock_foreground(false, false));
+}
+
+#[test]
+fn input_hooks_release_events_while_windows_hello_is_open() {
+    use bloqueio_transparente::windows_policy::should_block_lock_input;
+
+    assert!(should_block_lock_input(true, false));
+    assert!(!should_block_lock_input(true, true));
+    assert!(!should_block_lock_input(false, false));
+}
+
+#[test]
+fn windows_hello_keeps_the_permanent_win_l_hook_installed() {
+    use bloqueio_transparente::windows_policy::should_suspend_hooks_for_windows_hello;
+
+    assert!(!should_suspend_hooks_for_windows_hello(true));
+    assert!(should_suspend_hooks_for_windows_hello(false));
+}
+
+#[test]
+fn win_l_starts_transparent_lock_only_when_replacement_is_enabled_and_screen_is_free() {
+    use bloqueio_transparente::windows_policy::should_trigger_transparent_lock;
+
+    assert!(should_trigger_transparent_lock(
+        true, false, 0x4c, true, true
+    ));
+    assert!(!should_trigger_transparent_lock(
+        false, false, 0x4c, true, true
+    ));
+    assert!(!should_trigger_transparent_lock(
+        true, true, 0x4c, true, true
+    ));
+    assert!(!should_trigger_transparent_lock(
+        true, false, 0x4c, false, true
+    ));
+    assert!(!should_trigger_transparent_lock(
+        true, false, 0x4c, true, false
+    ));
+}
+
+#[test]
+fn win_l_policy_restores_the_value_that_existed_before_replacement() {
+    use bloqueio_transparente::windows_policy::{WinLRestoreAction, win_l_restore_action};
+
+    assert_eq!(
+        win_l_restore_action(Some(2), Some(1)),
+        WinLRestoreAction::Delete
+    );
+    assert_eq!(
+        win_l_restore_action(Some(0), Some(1)),
+        WinLRestoreAction::Write(0)
+    );
+    assert_eq!(
+        win_l_restore_action(Some(1), Some(1)),
+        WinLRestoreAction::Write(1)
+    );
+    assert_eq!(
+        win_l_restore_action(None, Some(1)),
+        WinLRestoreAction::Write(0)
+    );
+    assert_eq!(
+        win_l_restore_action(None, None),
+        WinLRestoreAction::NoChange
+    );
 }

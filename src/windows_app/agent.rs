@@ -1,27 +1,23 @@
 use super::{DISPLAY_NAME, ipc};
-use crate::lock::{Action, Event, LockController, LockState};
+use crate::lock::{Action, Event, LockController, LockState, UnlockMethod};
 use crate::protocol::{ClientRequest, ServiceResponse};
 use crate::windows_policy::{
     ClockWidgetLayout, ImageLayout, KeyDecision, KeyEvent, MonitorRect, OverlayLayout, VirtualKey,
     clock_date_label, dimming_alpha,
 };
 use anyhow::{Context, Result, bail};
-use std::mem::{size_of, zeroed};
+use std::mem::zeroed;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::Registry::{
-    HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_OPTION_NON_VOLATILE,
-    RegCloseKey, RegCreateKeyExW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
-};
 use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows_sys::Win32::System::Shutdown::LockWorkStation;
-use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+use windows_sys::Win32::System::SystemInformation::{GetLocalTime, GetTickCount, GetTickCount64};
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::Shell::*;
@@ -33,12 +29,21 @@ const HOTKEY_ID: i32 = 0x4254;
 const TIMER_ID: usize = 1;
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_LOCK_REQUEST: u32 = WM_APP + 2;
+const WM_HELLO_REQUEST: u32 = WM_APP + 3;
+const WM_HELLO_COMPLETE: u32 = WM_APP + 4;
+const PROMPT_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(15);
 const MENU_LOCK: usize = 1001;
 const MENU_SETTINGS: usize = 1002;
 const MENU_STATUS: usize = 1003;
+const MENU_SHUTDOWN: usize = 1004;
 
 static RUNTIME: OnceLock<Mutex<AgentRuntime>> = OnceLock::new();
 static LOCKED: AtomicBool = AtomicBool::new(false);
+static WINDOWS_HELLO_ENABLED: AtomicBool = AtomicBool::new(false);
+static WIN_L_ENABLED: AtomicBool = AtomicBool::new(false);
+static HELLO_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static HELLO_REQUEST_PENDING: AtomicBool = AtomicBool::new(false);
+static HELLO_RETRY_AFTER_MS: AtomicU64 = AtomicU64::new(0);
 static MANAGER_WINDOW: AtomicIsize = AtomicIsize::new(0);
 static TASKBAR_CREATED_MESSAGE: AtomicU32 = AtomicU32::new(0);
 
@@ -49,7 +54,14 @@ struct AgentRuntime {
     prompt: HWND,
     hooks: Option<HookThread>,
     last_heartbeat: Instant,
+    last_idle_settings_refresh: Instant,
+    idle_timeout_minutes: u16,
     unlock_message: String,
+    windows_hello_enabled: bool,
+    hello_error: Option<String>,
+    hello_cancellation: Option<super::windows_hello::VerificationCancellation>,
+    prompt_last_activity: Option<Instant>,
+    prompt_last_input_tick: Option<u32>,
     widget: crate::config::WidgetConfig,
     unlock_logo_path: Option<String>,
     hide_taskbar_on_lock: bool,
@@ -134,7 +146,14 @@ pub fn run(start_locked: bool) -> Result<()> {
             prompt: null_mut(),
             hooks: None,
             last_heartbeat: Instant::now(),
+            last_idle_settings_refresh: Instant::now() - Duration::from_secs(5),
+            idle_timeout_minutes: 0,
             unlock_message: crate::config::default_unlock_message(),
+            windows_hello_enabled: false,
+            hello_error: None,
+            hello_cancellation: None,
+            prompt_last_activity: None,
+            prompt_last_input_tick: None,
             widget: crate::config::WidgetConfig::default(),
             unlock_logo_path: None,
             hide_taskbar_on_lock: false,
@@ -147,9 +166,10 @@ pub fn run(start_locked: bool) -> Result<()> {
         register_hotkey(manager)?;
         add_tray_icon(manager)?;
         start_agent_pipe(manager)?;
-        // A integração com Win + L está suspensa. Restaura a política normal
-        // para instalações que tinham a opção ativa em versões anteriores.
+        // Corrige qualquer política deixada por uma interrupção anterior antes
+        // de tentar habilitar novamente a substituição.
         let _ = configure_win_l_override(false);
+        refresh_win_l_setting();
         SetTimer(manager, TIMER_ID, 1000, None);
         // Recupera a barra de tarefas caso uma instância anterior tenha sido
         // encerrada enquanto o Windows exibia a área de trabalho segura.
@@ -165,6 +185,7 @@ pub fn run(start_locked: bool) -> Result<()> {
         }
         delete_tray_icon(manager);
         UnregisterHotKey(manager, HOTKEY_ID);
+        WIN_L_ENABLED.store(false, Ordering::Release);
         let _ = configure_win_l_override(false);
         Ok(())
     }
@@ -199,11 +220,33 @@ pub fn current_session_id() -> Result<u32> {
 
 pub fn request_lock() -> Result<()> {
     let runtime = RUNTIME.get().context("agente não inicializado")?;
-    let actions = runtime
-        .lock()
-        .map_err(|_| anyhow::anyhow!("estado do agente indisponível"))?
-        .controller
-        .handle(Event::LockRequested, Instant::now());
+    let settings = ipc::send_current_session(&ClientRequest::Settings)
+        .context("não foi possível consultar o método de desbloqueio")?;
+    let ServiceResponse::Settings {
+        windows_hello_enabled,
+        ..
+    } = settings
+    else {
+        bail!("o serviço não informou o método de desbloqueio");
+    };
+    WINDOWS_HELLO_ENABLED.store(windows_hello_enabled, Ordering::Release);
+    let actions = {
+        let mut runtime = runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("estado do agente indisponível"))?;
+        runtime.windows_hello_enabled = windows_hello_enabled;
+        runtime.hello_error = None;
+        runtime
+            .controller
+            .set_unlock_method(if windows_hello_enabled {
+                UnlockMethod::WindowsHello
+            } else {
+                UnlockMethod::Password
+            });
+        runtime
+            .controller
+            .handle(Event::LockRequested, Instant::now())
+    };
     if let Err(error) = apply_actions(actions) {
         activate_windows_fallback().context("falha ao aplicar o bloqueio e a recuperação")?;
         return Err(error.context("falha ao aplicar o bloqueio transparente"));
@@ -231,6 +274,17 @@ unsafe extern "system" fn window_proc(
         }
         WM_LOCK_REQUEST => {
             let _ = request_lock();
+            0
+        }
+        WM_HELLO_REQUEST => {
+            HELLO_REQUEST_PENDING.store(false, Ordering::Release);
+            handle_event(Event::UserInteraction);
+            0
+        }
+        WM_HELLO_COMPLETE => {
+            let outcome =
+                unsafe { Box::from_raw(lparam as *mut super::windows_hello::VerificationOutcome) };
+            finish_windows_hello(*outcome);
             0
         }
         WM_CHAR => {
@@ -308,12 +362,25 @@ fn apply_actions(actions: Vec<Action>) -> Result<()> {
     for action in actions {
         match action {
             Action::ShowOverlays => create_overlays()?,
-            Action::HideOverlays => destroy_overlays(),
+            Action::HideOverlays => {
+                clear_prompt_activity_tracking();
+                destroy_overlays();
+            }
             Action::RebuildOverlays => rebuild_overlays()?,
             Action::InstallInputHooks => install_hooks()?,
-            Action::RemoveInputHooks => remove_hooks(),
-            Action::ShowPasswordPrompt => show_prompt()?,
-            Action::HidePasswordPrompt => hide_prompt(),
+            Action::RemoveInputHooks => {
+                if !WIN_L_ENABLED.load(Ordering::Acquire) {
+                    remove_hooks();
+                }
+            }
+            Action::ShowPasswordPrompt => {
+                show_prompt()?;
+                begin_prompt_activity_tracking();
+            }
+            Action::HidePasswordPrompt => {
+                clear_prompt_activity_tracking();
+                hide_prompt();
+            }
             Action::ShowPasswordError => invalidate_prompt(),
             Action::VerifyPassword(candidate) => {
                 invalidate_prompt();
@@ -325,6 +392,8 @@ fn apply_actions(actions: Vec<Action>) -> Result<()> {
                 }
                 verify_password(&candidate);
             }
+            Action::VerifyWindowsHello => verify_windows_hello(),
+            Action::CancelWindowsHello => cancel_windows_hello(),
             Action::LockWindows => {
                 activate_windows_fallback()?;
             }
@@ -354,6 +423,97 @@ fn verify_password(candidate: &str) {
             retry_after_seconds,
         }),
         _ => handle_event(Event::ConfigurationCorrupt),
+    }
+}
+
+fn verify_windows_hello() {
+    if HELLO_IN_PROGRESS.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let owner = RUNTIME
+        .get()
+        .and_then(|runtime| runtime.lock().ok())
+        .map(|runtime| runtime.prompt)
+        .unwrap_or(null_mut());
+    if owner.is_null() {
+        HELLO_IN_PROGRESS.store(false, Ordering::Release);
+        handle_event(Event::AlternativeAuthenticationRejected);
+        return;
+    }
+
+    if crate::windows_policy::should_suspend_hooks_for_windows_hello(
+        WIN_L_ENABLED.load(Ordering::Acquire),
+    ) {
+        remove_hooks();
+    }
+    let manager = MANAGER_WINDOW.load(Ordering::Acquire);
+    let cancellation = super::windows_hello::verify_for_window_async(
+        owner as isize,
+        "Confirme sua identidade para desbloquear a tela".to_owned(),
+        move |outcome| {
+            let outcome = Box::into_raw(Box::new(outcome));
+            if unsafe { PostMessageW(manager as HWND, WM_HELLO_COMPLETE, 0, outcome as LPARAM) }
+                == 0
+            {
+                unsafe { drop(Box::from_raw(outcome)) };
+                HELLO_IN_PROGRESS.store(false, Ordering::Release);
+            }
+        },
+    );
+    if let Some(runtime) = RUNTIME.get()
+        && let Ok(mut runtime) = runtime.lock()
+    {
+        runtime.hello_cancellation = Some(cancellation);
+    }
+}
+
+fn finish_windows_hello(outcome: super::windows_hello::VerificationOutcome) {
+    let verified = matches!(outcome, super::windows_hello::VerificationOutcome::Verified);
+    if let Some(runtime) = RUNTIME.get()
+        && let Ok(mut runtime) = runtime.lock()
+    {
+        runtime.hello_cancellation.take();
+    }
+    if let super::windows_hello::VerificationOutcome::Rejected(message) = outcome {
+        if let Some(runtime) = RUNTIME.get()
+            && let Ok(mut runtime) = runtime.lock()
+        {
+            runtime.hello_error = Some(message);
+        }
+        HELLO_RETRY_AFTER_MS.store(unsafe { GetTickCount64() } + 1_000, Ordering::Release);
+    }
+    HELLO_IN_PROGRESS.store(false, Ordering::Release);
+    handle_event(if verified {
+        Event::AlternativeAuthenticationAccepted
+    } else {
+        Event::AlternativeAuthenticationRejected
+    });
+}
+
+fn cancel_windows_hello() {
+    if let Some(runtime) = RUNTIME.get()
+        && let Ok(mut runtime) = runtime.lock()
+        && let Some(mut cancellation) = runtime.hello_cancellation.take()
+    {
+        cancellation.cancel();
+    }
+}
+
+fn begin_prompt_activity_tracking() {
+    if let Some(runtime) = RUNTIME.get()
+        && let Ok(mut runtime) = runtime.lock()
+    {
+        runtime.prompt_last_activity = Some(Instant::now());
+        runtime.prompt_last_input_tick = last_input_tick();
+    }
+}
+
+fn clear_prompt_activity_tracking() {
+    if let Some(runtime) = RUNTIME.get()
+        && let Ok(mut runtime) = runtime.lock()
+    {
+        runtime.prompt_last_activity = None;
+        runtime.prompt_last_input_tick = None;
     }
 }
 
@@ -479,6 +639,9 @@ fn rebuild_overlays() -> Result<()> {
 
 fn destroy_overlays() {
     LOCKED.store(false, Ordering::SeqCst);
+    WINDOWS_HELLO_ENABLED.store(false, Ordering::Release);
+    HELLO_IN_PROGRESS.store(false, Ordering::Release);
+    HELLO_REQUEST_PENDING.store(false, Ordering::Release);
     if let Some(runtime) = RUNTIME.get()
         && let Ok(mut runtime) = runtime.lock()
     {
@@ -782,7 +945,7 @@ fn paint_unlock_prompt(dc: HDC, logo_path: Option<&str>) {
         }
     }
 
-    let (message, count, failed, retry_after, state) = RUNTIME
+    let (message, count, failed, retry_after, state, windows_hello_enabled, hello_error) = RUNTIME
         .get()
         .and_then(|runtime| runtime.lock().ok())
         .map(|runtime| {
@@ -797,9 +960,21 @@ fn paint_unlock_prompt(dc: HDC, logo_path: Option<&str>) {
                         .max(1)
                 }),
                 runtime.controller.state(),
+                runtime.windows_hello_enabled,
+                runtime.hello_error.clone(),
             )
         })
-        .unwrap_or_else(|| (String::new(), 0, false, None, LockState::Prompting));
+        .unwrap_or_else(|| {
+            (
+                String::new(),
+                0,
+                false,
+                None,
+                LockState::Prompting,
+                false,
+                None,
+            )
+        });
     let heading_top = if logo_path.is_some() { 108 } else { 84 };
     draw_gdi_text(
         dc,
@@ -817,7 +992,11 @@ fn paint_unlock_prompt(dc: HDC, logo_path: Option<&str>) {
     );
     draw_gdi_text(
         dc,
-        &message,
+        if windows_hello_enabled {
+            "Confirme sua identidade com o Windows Hello"
+        } else {
+            &message
+        },
         RECT {
             left: 56,
             top: heading_top + 36,
@@ -829,6 +1008,34 @@ fn paint_unlock_prompt(dc: HDC, logo_path: Option<&str>) {
         muted,
         DT_CENTER | DT_VCENTER | DT_WORDBREAK,
     );
+
+    if windows_hello_enabled {
+        let (status, status_color) = if state == LockState::Verifying {
+            ("Aguardando o Windows Hello".to_owned(), primary)
+        } else if let Some(error) = hello_error {
+            (error, error_color)
+        } else {
+            (
+                "Mova o mouse ou pressione uma tecla para confirmar novamente".to_owned(),
+                muted,
+            )
+        };
+        draw_gdi_text(
+            dc,
+            &status,
+            RECT {
+                left: 64,
+                top: heading_top + 104,
+                right: width - 64,
+                bottom: heading_top + 156,
+            },
+            15,
+            FW_NORMAL as i32,
+            status_color,
+            DT_CENTER | DT_VCENTER | DT_WORDBREAK,
+        );
+        return;
+    }
 
     let field_top = heading_top + 108;
     draw_gdi_text(
@@ -991,6 +1198,14 @@ const fn rgb(red: u8, green: u8, blue: u8) -> COLORREF {
     red as u32 | ((green as u32) << 8) | ((blue as u32) << 16)
 }
 
+const fn widget_color(red: u8, green: u8, blue: u8, opacity_percentage: u8) -> COLORREF {
+    rgb(
+        crate::windows_policy::apply_widget_opacity(red, opacity_percentage),
+        crate::windows_policy::apply_widget_opacity(green, opacity_percentage),
+        crate::windows_policy::apply_widget_opacity(blue, opacity_percentage),
+    )
+}
+
 fn paint_widget(window: HWND, dc: HDC, widget: &crate::config::WidgetConfig) {
     use crate::config::WidgetKind;
     if widget.kind == WidgetKind::None {
@@ -1022,14 +1237,13 @@ fn paint_widget(window: HWND, dc: HDC, widget: &crate::config::WidgetConfig) {
             let mut time: SYSTEMTIME = unsafe { zeroed() };
             unsafe { GetLocalTime(&mut time) };
             let clock = ClockWidgetLayout::from_widget(layout);
-            draw_clock_panel(dc, clock);
             draw_clock_text(
                 dc,
                 &format!("{:02}:{:02}", time.wHour, time.wMinute),
                 clock.time,
                 clock.time_font_size,
                 FW_SEMIBOLD as i32,
-                rgb(246, 248, 251),
+                widget_color(246, 248, 251, widget.opacity_percentage),
                 "Bahnschrift SemiBold",
             );
             draw_clock_text(
@@ -1038,61 +1252,24 @@ fn paint_widget(window: HWND, dc: HDC, widget: &crate::config::WidgetConfig) {
                 clock.date,
                 clock.date_font_size,
                 FW_NORMAL as i32,
-                rgb(166, 181, 198),
+                widget_color(166, 181, 198, widget.opacity_percentage),
                 "Bahnschrift",
             );
         }
         WidgetKind::Image => {
             if let Some(path) = widget.image_path.as_deref() {
-                draw_image(dc, path, layout.x, layout.y, layout.width, layout.height);
+                draw_image_with_opacity(
+                    dc,
+                    path,
+                    layout.x,
+                    layout.y,
+                    layout.width,
+                    layout.height,
+                    widget.opacity_percentage,
+                );
             }
         }
         WidgetKind::None => {}
-    }
-}
-
-fn draw_clock_panel(dc: HDC, layout: ClockWidgetLayout) {
-    draw_rounded_panel(
-        dc,
-        layout.outer,
-        layout.corner_radius,
-        rgb(12, 15, 20),
-        rgb(84, 101, 120),
-    );
-    draw_rounded_panel(
-        dc,
-        layout.inner,
-        (layout.corner_radius - 4).max(6),
-        rgb(23, 28, 35),
-        rgb(47, 60, 74),
-    );
-}
-
-fn draw_rounded_panel(
-    dc: HDC,
-    layout: crate::windows_policy::WidgetLayout,
-    radius: i32,
-    fill: COLORREF,
-    border: COLORREF,
-) {
-    unsafe {
-        let brush = CreateSolidBrush(fill);
-        let pen = CreatePen(PS_SOLID, 1, border);
-        let previous_brush = SelectObject(dc, brush);
-        let previous_pen = SelectObject(dc, pen);
-        RoundRect(
-            dc,
-            layout.x,
-            layout.y,
-            layout.x + layout.width,
-            layout.y + layout.height,
-            radius * 2,
-            radius * 2,
-        );
-        SelectObject(dc, previous_pen);
-        SelectObject(dc, previous_brush);
-        DeleteObject(pen);
-        DeleteObject(brush);
     }
 }
 
@@ -1147,6 +1324,19 @@ fn draw_clock_text(
 }
 
 fn draw_image(dc: HDC, path: &str, x: i32, y: i32, width: i32, height: i32) {
+    draw_image_with_opacity(dc, path, x, y, width, height, 100);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_image_with_opacity(
+    dc: HDC,
+    path: &str,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    opacity_percentage: u8,
+) {
     let Ok(image) = image::open(path).map(|image| image.to_rgba8()) else {
         return;
     };
@@ -1158,6 +1348,9 @@ fn draw_image(dc: HDC, path: &str, x: i32, y: i32, width: i32, height: i32) {
     let mut pixels = image.into_raw();
     for pixel in pixels.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
+        pixel[0] = crate::windows_policy::apply_widget_opacity(pixel[0], opacity_percentage);
+        pixel[1] = crate::windows_policy::apply_widget_opacity(pixel[1], opacity_percentage);
+        pixel[2] = crate::windows_policy::apply_widget_opacity(pixel[2], opacity_percentage);
     }
     let mut info: BITMAPINFO = unsafe { zeroed() };
     info.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
@@ -1276,7 +1469,13 @@ fn remove_hooks() {
 
 unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
-        if code >= 0 && LOCKED.load(Ordering::Relaxed) {
+        if code >= 0
+            && crate::windows_policy::should_block_lock_input(
+                LOCKED.load(Ordering::Relaxed),
+                HELLO_IN_PROGRESS.load(Ordering::Acquire),
+            )
+        {
+            post_windows_hello_request();
             1
         } else {
             CallNextHookEx(null_mut(), code, wparam, lparam)
@@ -1290,8 +1489,31 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
             return CallNextHookEx(null_mut(), code, wparam, lparam);
         }
         let data = &*(lparam as *const KBDLLHOOKSTRUCT);
-        if !LOCKED.load(Ordering::Relaxed) {
+        let key_down = wparam as u32 == WM_KEYDOWN || wparam as u32 == WM_SYSKEYDOWN;
+        let windows_key_down =
+            GetAsyncKeyState(VK_LWIN as i32) < 0 || GetAsyncKeyState(VK_RWIN as i32) < 0;
+        if crate::windows_policy::should_trigger_transparent_lock(
+            WIN_L_ENABLED.load(Ordering::Acquire),
+            LOCKED.load(Ordering::Relaxed),
+            data.vkCode,
+            windows_key_down,
+            key_down,
+        ) {
+            let manager = MANAGER_WINDOW.load(Ordering::Acquire) as HWND;
+            if !manager.is_null() {
+                PostMessageW(manager, WM_LOCK_REQUEST, 0, 0);
+            }
             return CallNextHookEx(null_mut(), code, wparam, lparam);
+        }
+        if !crate::windows_policy::should_block_lock_input(
+            LOCKED.load(Ordering::Relaxed),
+            HELLO_IN_PROGRESS.load(Ordering::Acquire),
+        ) {
+            return CallNextHookEx(null_mut(), code, wparam, lparam);
+        }
+        if key_down && WINDOWS_HELLO_ENABLED.load(Ordering::Acquire) {
+            post_windows_hello_request();
+            return 1;
         }
         let key = match data.vkCode {
             key if key == VK_TAB as u32 => VirtualKey::Tab,
@@ -1305,7 +1527,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
             control: GetAsyncKeyState(VK_CONTROL as i32) < 0,
             alt: data.flags & LLKHF_ALTDOWN != 0,
             shift: GetAsyncKeyState(VK_SHIFT as i32) < 0,
-            key_down: wparam as u32 == WM_KEYDOWN || wparam as u32 == WM_SYSKEYDOWN,
+            key_down,
         };
         let foreground = GetForegroundWindow();
         let mut process_id = 0;
@@ -1339,75 +1561,89 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
     }
 }
 
-pub(super) fn configure_win_l_override(enabled: bool) -> Result<()> {
-    let path = wide(r"Software\Microsoft\Windows\CurrentVersion\Policies\System");
-    let name = wide("DisableLockWorkstation");
-    let current = read_win_l_override(&path, &name);
-    if !crate::windows_policy::win_l_registry_update_needed(current, enabled) {
-        return Ok(());
+unsafe fn post_windows_hello_request() {
+    if !WINDOWS_HELLO_ENABLED.load(Ordering::Acquire)
+        || HELLO_IN_PROGRESS.load(Ordering::Acquire)
+        || unsafe { GetTickCount64() } < HELLO_RETRY_AFTER_MS.load(Ordering::Acquire)
+    {
+        return;
     }
-    let mut key = null_mut();
-    let status = unsafe {
-        RegCreateKeyExW(
-            HKEY_CURRENT_USER,
-            path.as_ptr(),
-            0,
-            null_mut(),
-            REG_OPTION_NON_VOLATILE,
-            KEY_SET_VALUE,
-            null(),
-            &mut key,
-            null_mut(),
-        )
-    };
-    if status != ERROR_SUCCESS {
-        bail!("não foi possível configurar Win + L: erro {status}");
+    let manager = MANAGER_WINDOW.load(Ordering::Acquire) as HWND;
+    if !manager.is_null()
+        && HELLO_REQUEST_PENDING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        && unsafe { PostMessageW(manager, WM_HELLO_REQUEST, 0, 0) } == 0
+    {
+        HELLO_REQUEST_PENDING.store(false, Ordering::Release);
     }
-    let value = u32::from(enabled).to_ne_bytes();
-    let status = unsafe { RegSetValueExW(key, name.as_ptr(), 0, REG_DWORD, value.as_ptr(), 4) };
-    unsafe { RegCloseKey(key) };
-    if status != ERROR_SUCCESS {
-        bail!("não foi possível salvar a configuração de Win + L: erro {status}");
-    }
-    Ok(())
 }
 
-fn read_win_l_override(path: &[u16], name: &[u16]) -> Option<u32> {
-    let mut key = null_mut();
-    if unsafe {
-        RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            path.as_ptr(),
-            0,
-            KEY_QUERY_VALUE,
-            &mut key,
-        )
-    } != ERROR_SUCCESS
-    {
-        return None;
+pub(super) fn configure_win_l_override(enabled: bool) -> Result<()> {
+    match ipc::send_current_session(&ClientRequest::ApplyWinLPolicy { enabled })? {
+        ServiceResponse::Ok => Ok(()),
+        ServiceResponse::Error { message } => bail!(message),
+        response => bail!("resposta inesperada ao configurar Win + L: {response:?}"),
     }
-    let mut value = 0_u32;
-    let mut value_type = 0_u32;
-    let mut size = size_of::<u32>() as u32;
-    let status = unsafe {
-        RegQueryValueExW(
-            key,
-            name.as_ptr(),
-            null_mut(),
-            &mut value_type,
-            (&mut value as *mut u32).cast(),
-            &mut size,
-        )
+}
+
+fn refresh_win_l_setting() {
+    let Ok(ServiceResponse::Settings { win_l_enabled, .. }) =
+        ipc::send_current_session(&ClientRequest::Settings)
+    else {
+        return;
     };
-    unsafe { RegCloseKey(key) };
-    (status == ERROR_SUCCESS && value_type == REG_DWORD && size == size_of::<u32>() as u32)
-        .then_some(value)
+    let current = WIN_L_ENABLED.load(Ordering::Acquire);
+    if current == win_l_enabled {
+        return;
+    }
+
+    if win_l_enabled {
+        WIN_L_ENABLED.store(true, Ordering::Release);
+        let result = install_hooks().and_then(|()| configure_win_l_override(true));
+        if let Err(error) = result {
+            WIN_L_ENABLED.store(false, Ordering::Release);
+            let _ = configure_win_l_override(false);
+            if !LOCKED.load(Ordering::Acquire) {
+                remove_hooks();
+            }
+            if let Some(runtime) = RUNTIME.get()
+                && let Ok(mut runtime) = runtime.lock()
+            {
+                runtime.hello_error = Some(format!("Não foi possível ativar Win + L: {error}"));
+            }
+        }
+    } else {
+        let _ = configure_win_l_override(false);
+        WIN_L_ENABLED.store(false, Ordering::Release);
+        if !LOCKED.load(Ordering::Acquire) {
+            remove_hooks();
+        }
+    }
 }
 
 fn timer_tick() {
     send_heartbeat_if_due();
-    if LOCKED.load(Ordering::SeqCst)
-        && let Some(runtime) = RUNTIME.get()
+    refresh_idle_timeout_if_due();
+    refresh_win_l_setting();
+    close_inactive_prompt_if_due();
+    if !LOCKED.load(Ordering::SeqCst) {
+        let timeout_minutes = RUNTIME
+            .get()
+            .and_then(|runtime| runtime.lock().ok())
+            .map(|runtime| runtime.idle_timeout_minutes)
+            .unwrap_or(0);
+        if system_idle_duration().is_some_and(|idle_duration| {
+            crate::windows_policy::inactivity_lock_due(timeout_minutes, idle_duration, false)
+        }) {
+            let _ = request_lock();
+            return;
+        }
+    }
+    if crate::windows_policy::should_enforce_lock_foreground(
+        LOCKED.load(Ordering::SeqCst),
+        HELLO_IN_PROGRESS.load(Ordering::Acquire),
+    ) && let Some(runtime) = RUNTIME.get()
         && let Ok(runtime) = runtime.lock()
     {
         let target = if runtime.prompt.is_null() {
@@ -1435,6 +1671,76 @@ fn timer_tick() {
             handle_event(Event::RetryDelayElapsed);
         }
     }
+}
+
+fn close_inactive_prompt_if_due() {
+    let now = Instant::now();
+    let current_input_tick = last_input_tick();
+    let due = RUNTIME
+        .get()
+        .and_then(|runtime| runtime.lock().ok())
+        .is_some_and(|mut runtime| {
+            let Some(last_activity) = runtime.prompt_last_activity else {
+                return false;
+            };
+            if current_input_tick != runtime.prompt_last_input_tick {
+                runtime.prompt_last_input_tick = current_input_tick;
+                runtime.prompt_last_activity = Some(now);
+                return false;
+            }
+            now.duration_since(last_activity) >= PROMPT_INACTIVITY_TIMEOUT
+                && matches!(
+                    runtime.controller.state(),
+                    LockState::Prompting | LockState::Verifying
+                )
+        });
+    if due {
+        handle_event(Event::PromptInactivityElapsed);
+    }
+}
+
+fn refresh_idle_timeout_if_due() {
+    let Some(runtime) = RUNTIME.get() else { return };
+    let should_refresh = match runtime.lock() {
+        Ok(mut runtime)
+            if runtime.last_idle_settings_refresh.elapsed() >= Duration::from_secs(5) =>
+        {
+            runtime.last_idle_settings_refresh = Instant::now();
+            true
+        }
+        _ => false,
+    };
+    if !should_refresh {
+        return;
+    }
+    if let Ok(ServiceResponse::Settings {
+        idle_timeout_minutes,
+        ..
+    }) = ipc::send_current_session(&ClientRequest::Settings)
+        && let Ok(mut runtime) = runtime.lock()
+    {
+        runtime.idle_timeout_minutes = idle_timeout_minutes;
+    }
+}
+
+fn system_idle_duration() -> Option<Duration> {
+    let mut input = LASTINPUTINFO {
+        cbSize: size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    if unsafe { GetLastInputInfo(&mut input) } == 0 {
+        return None;
+    }
+    let elapsed_milliseconds = unsafe { GetTickCount() }.wrapping_sub(input.dwTime);
+    Some(Duration::from_millis(u64::from(elapsed_milliseconds)))
+}
+
+fn last_input_tick() -> Option<u32> {
+    let mut input = LASTINPUTINFO {
+        cbSize: size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    (unsafe { GetLastInputInfo(&mut input) } != 0).then_some(input.dwTime)
 }
 
 fn send_heartbeat_if_due() {
@@ -1543,7 +1849,9 @@ fn add_tray_icon(window: HWND) -> Result<()> {
     } else {
         embedded_icon
     };
-    copy_wide(&mut data.szTip, DISPLAY_NAME);
+    let mut tooltip = [0; 128];
+    copy_wide(&mut tooltip, DISPLAY_NAME);
+    data.szTip = tooltip;
     if unsafe { Shell_NotifyIconW(NIM_ADD, &data) } == 0 {
         bail!("não foi possível criar o ícone da bandeja");
     }
@@ -1569,9 +1877,12 @@ fn show_tray_menu(window: HWND) {
         let lock = wide("Bloquear agora");
         let settings = wide("Configurações");
         let status = wide("Estado");
+        let shutdown = wide("Encerrar aplicativo");
         AppendMenuW(menu, MF_STRING, MENU_LOCK, lock.as_ptr());
         AppendMenuW(menu, MF_STRING, MENU_SETTINGS, settings.as_ptr());
         AppendMenuW(menu, MF_STRING, MENU_STATUS, status.as_ptr());
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        AppendMenuW(menu, MF_STRING, MENU_SHUTDOWN, shutdown.as_ptr());
         let mut point: POINT = zeroed();
         GetCursorPos(&mut point);
         SetForegroundWindow(window);
@@ -1592,17 +1903,20 @@ fn show_tray_menu(window: HWND) {
 }
 
 fn handle_menu(command: usize) {
-    match command {
-        MENU_LOCK => {
+    match crate::windows_policy::tray_menu_action(command) {
+        crate::windows_policy::TrayMenuAction::Lock => {
             let _ = request_lock();
         }
-        MENU_SETTINGS => {
+        crate::windows_policy::TrayMenuAction::OpenSettings => {
             let _ = spawn_cli("settings");
         }
-        MENU_STATUS => {
+        crate::windows_policy::TrayMenuAction::ShowStatus => {
             let _ = spawn_cli("status");
         }
-        _ => {}
+        crate::windows_policy::TrayMenuAction::Shutdown => {
+            let _ = ipc::send_current_session(&ClientRequest::Shutdown);
+        }
+        crate::windows_policy::TrayMenuAction::Ignore => {}
     }
 }
 
