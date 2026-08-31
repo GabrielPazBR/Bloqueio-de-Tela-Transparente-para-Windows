@@ -1,10 +1,14 @@
 use super::{DISPLAY_NAME, ipc};
 use crate::config::{Hotkey, IDLE_TIMEOUT_OPTIONS_MINUTES};
 use crate::protocol::{ClientRequest, ServiceResponse};
-use crate::settings_ui::{ProtectionStatus, SettingsModel, WidgetSizePreset};
+use crate::settings_ui::{
+    ProtectionStatus, SettingsModel, WidgetSizePreset, WindowsHelloButtonAction,
+    windows_hello_button_action,
+};
 use anyhow::{Context, Result, anyhow};
 use eframe::egui::{self, Color32, RichText, Stroke, Vec2};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
@@ -193,6 +197,8 @@ struct SettingsApp {
     confirmation_password: String,
     current_password: String,
     hello_password: String,
+    hello_activation_receiver: Option<Receiver<super::windows_hello::VerificationOutcome>>,
+    hello_activation_cancellation: Option<super::windows_hello::VerificationCancellation>,
     new_password: String,
     password_confirmation: String,
     shortcut_password: String,
@@ -200,6 +206,9 @@ struct SettingsApp {
     shortcut: Hotkey,
     saved_dimming_percentage: u8,
     lock_texture: egui::TextureHandle,
+    unlock_logo_preview_path: Option<String>,
+    unlock_logo_preview: Option<egui::TextureHandle>,
+    unlock_logo_preview_error: Option<String>,
     notice: Option<Notice>,
 }
 
@@ -216,13 +225,15 @@ impl SettingsApp {
             ),
             egui::TextureOptions::LINEAR,
         );
-        Self {
+        let mut app = Self {
             model,
             page: Page::Lock,
             confirmation: None,
             confirmation_password: String::new(),
             current_password: String::new(),
             hello_password: String::new(),
+            hello_activation_receiver: None,
+            hello_activation_cancellation: None,
             new_password: String::new(),
             password_confirmation: String::new(),
             shortcut_password: String::new(),
@@ -230,8 +241,13 @@ impl SettingsApp {
             shortcut,
             saved_dimming_percentage,
             lock_texture,
+            unlock_logo_preview_path: None,
+            unlock_logo_preview: None,
+            unlock_logo_preview_error: None,
             notice: None,
-        }
+        };
+        app.sync_unlock_logo_preview(context);
+        app
     }
 
     fn notify(&mut self, text: impl Into<String>, error: bool) {
@@ -263,51 +279,68 @@ impl SettingsApp {
         }
     }
 
-    fn confirm_windows_hello_change(&mut self, currently_enabled: bool) -> bool {
-        if currently_enabled {
-            return true;
-        }
-        let availability = match super::windows_hello::availability() {
-            Ok(value) => value,
-            Err(error) => {
-                self.notify(error.to_string(), true);
-                return false;
-            }
-        };
-        if availability
-            != windows::Security::Credentials::UI::UserConsentVerifierAvailability::Available
-        {
-            self.notify(
-                super::windows_hello::availability_message(availability),
-                true,
-            );
-            return false;
-        }
+    fn start_windows_hello_activation(&mut self, context: &egui::Context) {
         let owner = unsafe { GetForegroundWindow() };
         if owner.is_null() {
             self.notify(
                 "Não foi possível identificar a janela de configurações.",
                 true,
             );
-            return false;
+            return;
         }
-        match super::windows_hello::verify_for_window(
-            windows::Win32::Foundation::HWND(owner.cast()),
-            "Confirme sua identidade para ativar o Windows Hello",
-        ) {
-            Ok(result)
-                if result
-                    == windows::Security::Credentials::UI::UserConsentVerificationResult::Verified =>
-            {
-                true
+
+        let (sender, receiver) = mpsc::channel();
+        let context = context.clone();
+        let cancellation = super::windows_hello::verify_activation_for_window_async(
+            owner as isize,
+            "Confirme sua identidade para ativar o Windows Hello".to_owned(),
+            move |outcome| {
+                let _ = sender.send(outcome);
+                context.request_repaint();
+            },
+        );
+        self.hello_activation_receiver = Some(receiver);
+        self.hello_activation_cancellation = Some(cancellation);
+    }
+
+    fn set_windows_hello_enabled(&mut self, enabled: bool) {
+        let request = SettingsModel::set_windows_hello_request(&self.hello_password, enabled);
+        let success = if enabled {
+            "Windows Hello ativado como único desbloqueio."
+        } else {
+            "Windows Hello desativado."
+        };
+        if self.send(request, success) {
+            self.model.windows_hello_enabled = enabled;
+            clear(&mut self.hello_password);
+        }
+    }
+
+    fn poll_windows_hello_activation(&mut self) {
+        let outcome = match self
+            .hello_activation_receiver
+            .as_ref()
+            .map(Receiver::try_recv)
+        {
+            Some(Ok(outcome)) => outcome,
+            Some(Err(TryRecvError::Disconnected)) => {
+                super::windows_hello::VerificationOutcome::Rejected(
+                    "A verificação do Windows Hello foi interrompida.".to_owned(),
+                )
             }
-            Ok(result) => {
-                self.notify(super::windows_hello::verification_message(result), true);
-                false
+            Some(Err(TryRecvError::Empty)) | None => return,
+        };
+        self.hello_activation_receiver = None;
+        self.hello_activation_cancellation = None;
+        match outcome {
+            super::windows_hello::VerificationOutcome::Verified => {
+                self.set_windows_hello_enabled(true);
             }
-            Err(error) => {
-                self.notify(error.to_string(), true);
-                false
+            super::windows_hello::VerificationOutcome::Canceled => {
+                self.notify("Verificação cancelada.", true);
+            }
+            super::windows_hello::VerificationOutcome::Rejected(message) => {
+                self.notify(message, true);
             }
         }
     }
@@ -321,6 +354,28 @@ impl SettingsApp {
                 self.notify("Estado atualizado.", false);
             }
             Err(error) => self.notify(error.to_string(), true),
+        }
+    }
+
+    fn sync_unlock_logo_preview(&mut self, context: &egui::Context) {
+        let path = self
+            .model
+            .unlock_logo_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned);
+        if self.unlock_logo_preview_path == path {
+            return;
+        }
+
+        self.unlock_logo_preview_path = path.clone();
+        self.unlock_logo_preview = None;
+        self.unlock_logo_preview_error = None;
+        let Some(path) = path else { return };
+        match load_preview_texture(context, &path) {
+            Ok(texture) => self.unlock_logo_preview = Some(texture),
+            Err(error) => self.unlock_logo_preview_error = Some(error.to_string()),
         }
     }
 
@@ -578,26 +633,30 @@ impl SettingsApp {
                 .color(MUTED),
             );
             ui.add_space(12.0);
-            password_field(ui, "Senha atual do app", &mut self.hello_password);
-            ui.add_space(14.0);
             let enabled = self.model.windows_hello_enabled;
-            let label = if enabled {
-                "Desativar Windows Hello"
-            } else {
-                "Ativar Windows Hello"
-            };
-            if primary_button(ui, label).clicked() && self.confirm_windows_hello_change(enabled) {
-                let request =
-                    SettingsModel::set_windows_hello_request(&self.hello_password, !enabled);
-                let success = if enabled {
-                    "Windows Hello desativado."
+            let verification_in_progress = self.hello_activation_receiver.is_some();
+            ui.add_enabled_ui(!verification_in_progress, |ui| {
+                password_field(ui, "Senha atual do app", &mut self.hello_password);
+                ui.add_space(14.0);
+                let label = if enabled {
+                    "Desativar Windows Hello"
                 } else {
-                    "Windows Hello ativado como único desbloqueio."
+                    "Ativar Windows Hello"
                 };
-                if self.send(request, success) {
-                    self.model.windows_hello_enabled = !enabled;
-                    clear(&mut self.hello_password);
+                if primary_button(ui, label).clicked() {
+                    match windows_hello_button_action(enabled, verification_in_progress) {
+                        WindowsHelloButtonAction::StartVerification => {
+                            self.start_windows_hello_activation(ui.ctx());
+                        }
+                        WindowsHelloButtonAction::Disable => {
+                            self.set_windows_hello_enabled(false);
+                        }
+                        WindowsHelloButtonAction::Wait => {}
+                    }
                 }
+            });
+            if verification_in_progress {
+                ui.label(RichText::new("Aguardando o Windows Hello...").color(MUTED));
             }
         });
         ui.add_space(16.0);
@@ -768,6 +827,7 @@ impl SettingsApp {
 
     fn appearance_page(&mut self, ui: &mut egui::Ui) {
         use crate::config::WidgetKind;
+        self.sync_unlock_logo_preview(ui.ctx());
         page_title(
             ui,
             "Aparência",
@@ -873,19 +933,36 @@ impl SettingsApp {
             ui.add_space(10.0);
             ui.label("Arquivo da logo");
             let mut choose_logo = false;
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(self.model.unlock_logo_path.get_or_insert_default())
+            let path_changed = ui
+                .horizontal(|ui| {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(
+                            self.model.unlock_logo_path.get_or_insert_default(),
+                        )
                         .desired_width((ui.available_width() - 132.0).max(180.0)),
-                );
-                choose_logo = secondary_button(ui, "Escolher...").clicked();
-            });
+                    );
+                    choose_logo = secondary_button(ui, "Escolher...").clicked();
+                    response.changed()
+                })
+                .inner;
             if choose_logo {
                 match pick_image_file() {
                     Ok(Some(path)) => self.model.unlock_logo_path = Some(path),
                     Ok(None) => {}
                     Err(error) => self.notify(error.to_string(), true),
                 }
+            }
+            if path_changed || choose_logo {
+                self.sync_unlock_logo_preview(ui.ctx());
+            }
+            if let Some(texture) = &self.unlock_logo_preview {
+                let original = texture.size_vec2();
+                let scale = (240.0 / original.x).min(120.0 / original.y).min(1.0);
+                ui.add_space(10.0);
+                ui.image((texture.id(), original * scale));
+            } else if let Some(error) = &self.unlock_logo_preview_error {
+                ui.add_space(8.0);
+                ui.label(RichText::new(error).color(ERROR));
             }
             ui.label(
                 RichText::new("Formatos aceitos: PNG, JPEG e BMP. Deixe vazio para não exibir.")
@@ -988,6 +1065,7 @@ impl Drop for SettingsApp {
 
 impl eframe::App for SettingsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.poll_windows_hello_activation();
         let ctx = ui.ctx().clone();
         ui.horizontal_top(|ui| {
             self.sidebar(ui);
@@ -1065,6 +1143,19 @@ fn pick_image_file() -> Result<Option<String>> {
         CoTaskMemFree(Some(path.0.cast()));
         Ok(Some(value))
     }
+}
+
+fn load_preview_texture(context: &egui::Context, path: &str) -> Result<egui::TextureHandle> {
+    let image = image::open(path)
+        .with_context(|| format!("Não foi possível carregar a prévia de {path}"))?
+        .into_rgba8();
+    let size = [image.width() as usize, image.height() as usize];
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+    Ok(context.load_texture(
+        "unlock-logo-preview",
+        color_image,
+        egui::TextureOptions::LINEAR,
+    ))
 }
 
 fn page_title(ui: &mut egui::Ui, title: &str, subtitle: &str) {

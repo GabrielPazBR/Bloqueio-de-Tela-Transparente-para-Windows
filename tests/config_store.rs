@@ -97,6 +97,7 @@ fn existing_configuration_defaults_visual_customization_to_disabled() {
         config.widget.kind,
         bloqueio_transparente::config::WidgetKind::None
     );
+    assert_eq!(config.widget.opacity_percentage, 0);
     assert!(config.unlock_logo_path.is_none());
 }
 
@@ -212,6 +213,17 @@ fn new_configuration_defaults_to_forty_percent_dimming() {
     store.initialize("", Hotkey::default()).unwrap();
 
     assert_eq!(store.load().unwrap().dimming_percentage, 40);
+}
+
+#[test]
+fn new_configuration_defaults_to_fifteen_percent_widget_transparency_and_hidden_taskbar() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = ConfigStore::new(temp.path().join("config.json"));
+    store.initialize("", Hotkey::default()).unwrap();
+
+    let config = store.load().unwrap();
+    assert_eq!(config.widget.opacity_percentage, 15);
+    assert!(config.hide_taskbar_on_lock);
 }
 
 #[test]

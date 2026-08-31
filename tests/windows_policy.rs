@@ -99,12 +99,15 @@ fn dimming_percentage_maps_to_layered_window_alpha() {
 
 #[test]
 fn widget_transparency_fades_a_color_channel_as_the_slider_increases() {
-    use bloqueio_transparente::windows_policy::apply_widget_opacity;
+    use bloqueio_transparente::windows_policy::{apply_widget_opacity, widget_text_channel};
 
     assert_eq!(apply_widget_opacity(255, 0), 255);
     assert_eq!(apply_widget_opacity(255, 40), 153);
     assert_eq!(apply_widget_opacity(200, 50), 100);
     assert_eq!(apply_widget_opacity(255, 100), 0);
+    assert_eq!(widget_text_channel(0), 255);
+    assert_eq!(widget_text_channel(40), 153);
+    assert_eq!(widget_text_channel(100), 0);
 }
 
 #[test]
@@ -262,6 +265,46 @@ fn win_l_starts_transparent_lock_only_when_replacement_is_enabled_and_screen_is_
     ));
     assert!(!should_trigger_transparent_lock(
         true, false, 0x4c, true, false
+    ));
+}
+
+#[test]
+fn win_l_uses_the_key_events_reported_by_the_low_level_hook() {
+    use bloqueio_transparente::windows_policy::{
+        next_windows_key_mask, should_forward_windows_key_up,
+    };
+
+    let mut windows_keys = 0;
+    windows_keys = next_windows_key_mask(windows_keys, 0x5b, true, false);
+    assert_ne!(windows_keys, 0);
+    assert!(
+        bloqueio_transparente::windows_policy::should_trigger_transparent_lock(
+            true,
+            false,
+            0x4c,
+            windows_keys != 0,
+            true,
+        )
+    );
+    windows_keys = next_windows_key_mask(windows_keys, 0x5b, false, true);
+    assert_eq!(windows_keys, 0);
+
+    windows_keys = next_windows_key_mask(windows_keys, 0x5c, true, false);
+    assert_ne!(windows_keys, 0);
+    windows_keys = next_windows_key_mask(windows_keys, 0x5c, false, true);
+    assert_eq!(windows_keys, 0);
+
+    let passed_through_before_lock = 1;
+    assert!(should_forward_windows_key_up(
+        passed_through_before_lock,
+        0x5b,
+        true,
+    ));
+    assert!(!should_forward_windows_key_up(0, 0x5b, true));
+    assert!(!should_forward_windows_key_up(
+        passed_through_before_lock,
+        0x41,
+        true,
     ));
 }
 

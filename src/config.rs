@@ -10,6 +10,7 @@ pub const CONFIG_VERSION: u32 = 1;
 pub const DEFAULT_UNLOCK_MESSAGE: &str = "Digite a senha para desbloquear";
 pub const MAX_UNLOCK_MESSAGE_CHARS: usize = 80;
 pub const DEFAULT_DIMMING_PERCENTAGE: u8 = 40;
+pub const DEFAULT_WIDGET_TRANSPARENCY_PERCENTAGE: u8 = 15;
 pub const IDLE_TIMEOUT_OPTIONS_MINUTES: [u16; 7] = [0, 1, 5, 10, 15, 30, 60];
 
 pub fn default_unlock_message() -> String {
@@ -41,6 +42,13 @@ pub const fn default_widget_opacity() -> u8 {
     0
 }
 
+fn legacy_widget_config() -> WidgetConfig {
+    WidgetConfig {
+        opacity_percentage: default_widget_opacity(),
+        ..WidgetConfig::default()
+    }
+}
+
 impl Default for WidgetConfig {
     fn default() -> Self {
         Self {
@@ -50,7 +58,7 @@ impl Default for WidgetConfig {
             height: 120,
             x_percent: 50,
             y_percent: 5,
-            opacity_percentage: default_widget_opacity(),
+            opacity_percentage: DEFAULT_WIDGET_TRANSPARENCY_PERCENTAGE,
         }
     }
 }
@@ -107,7 +115,7 @@ pub struct AppConfig {
     pub unlock_message: String,
     #[serde(default)]
     pub hide_taskbar_on_lock: bool,
-    #[serde(default)]
+    #[serde(default = "legacy_widget_config")]
     pub widget: WidgetConfig,
     #[serde(default)]
     pub unlock_logo_path: Option<String>,
@@ -187,7 +195,7 @@ impl ConfigStore {
             win_l_enabled: false,
             dimming_percentage: DEFAULT_DIMMING_PERCENTAGE,
             unlock_message: default_unlock_message(),
-            hide_taskbar_on_lock: false,
+            hide_taskbar_on_lock: true,
             widget: WidgetConfig::default(),
             unlock_logo_path: None,
             hotkey,

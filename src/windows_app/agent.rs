@@ -8,7 +8,7 @@ use crate::windows_policy::{
 use anyhow::{Context, Result, bail};
 use std::mem::zeroed;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -41,6 +41,8 @@ static RUNTIME: OnceLock<Mutex<AgentRuntime>> = OnceLock::new();
 static LOCKED: AtomicBool = AtomicBool::new(false);
 static WINDOWS_HELLO_ENABLED: AtomicBool = AtomicBool::new(false);
 static WIN_L_ENABLED: AtomicBool = AtomicBool::new(false);
+static WINDOWS_KEY_MASK: AtomicU8 = AtomicU8::new(0);
+static PASSED_THROUGH_WINDOWS_KEY_MASK: AtomicU8 = AtomicU8::new(0);
 static HELLO_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static HELLO_REQUEST_PENDING: AtomicBool = AtomicBool::new(false);
 static HELLO_RETRY_AFTER_MS: AtomicU64 = AtomicU64::new(0);
@@ -1198,12 +1200,9 @@ const fn rgb(red: u8, green: u8, blue: u8) -> COLORREF {
     red as u32 | ((green as u32) << 8) | ((blue as u32) << 16)
 }
 
-const fn widget_color(red: u8, green: u8, blue: u8, opacity_percentage: u8) -> COLORREF {
-    rgb(
-        crate::windows_policy::apply_widget_opacity(red, opacity_percentage),
-        crate::windows_policy::apply_widget_opacity(green, opacity_percentage),
-        crate::windows_policy::apply_widget_opacity(blue, opacity_percentage),
-    )
+const fn widget_color(transparency_percentage: u8) -> COLORREF {
+    let channel = crate::windows_policy::widget_text_channel(transparency_percentage);
+    rgb(channel, channel, channel)
 }
 
 fn paint_widget(window: HWND, dc: HDC, widget: &crate::config::WidgetConfig) {
@@ -1243,7 +1242,7 @@ fn paint_widget(window: HWND, dc: HDC, widget: &crate::config::WidgetConfig) {
                 clock.time,
                 clock.time_font_size,
                 FW_SEMIBOLD as i32,
-                widget_color(246, 248, 251, widget.opacity_percentage),
+                widget_color(widget.opacity_percentage),
                 "Bahnschrift SemiBold",
             );
             draw_clock_text(
@@ -1252,7 +1251,7 @@ fn paint_widget(window: HWND, dc: HDC, widget: &crate::config::WidgetConfig) {
                 clock.date,
                 clock.date_font_size,
                 FW_NORMAL as i32,
-                widget_color(166, 181, 198, widget.opacity_percentage),
+                widget_color(widget.opacity_percentage),
                 "Bahnschrift",
             );
         }
@@ -1420,6 +1419,8 @@ fn install_hooks() -> Result<()> {
     {
         return Ok(());
     }
+    WINDOWS_KEY_MASK.store(0, Ordering::Release);
+    PASSED_THROUGH_WINDOWS_KEY_MASK.store(0, Ordering::Release);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let join = std::thread::spawn(move || unsafe {
         let thread_id = windows_sys::Win32::System::Threading::GetCurrentThreadId();
@@ -1460,6 +1461,8 @@ fn install_hooks() -> Result<()> {
 }
 
 fn remove_hooks() {
+    WINDOWS_KEY_MASK.store(0, Ordering::Release);
+    PASSED_THROUGH_WINDOWS_KEY_MASK.store(0, Ordering::Release);
     if let Some(runtime) = RUNTIME.get()
         && let Ok(mut runtime) = runtime.lock()
     {
@@ -1490,13 +1493,39 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
         }
         let data = &*(lparam as *const KBDLLHOOKSTRUCT);
         let key_down = wparam as u32 == WM_KEYDOWN || wparam as u32 == WM_SYSKEYDOWN;
-        let windows_key_down =
-            GetAsyncKeyState(VK_LWIN as i32) < 0 || GetAsyncKeyState(VK_RWIN as i32) < 0;
+        let key_up = wparam as u32 == WM_KEYUP || wparam as u32 == WM_SYSKEYUP;
+        let current_windows_keys = WINDOWS_KEY_MASK.load(Ordering::Acquire);
+        let windows_keys = crate::windows_policy::next_windows_key_mask(
+            current_windows_keys,
+            data.vkCode,
+            key_down,
+            key_up,
+        );
+        if windows_keys != current_windows_keys {
+            WINDOWS_KEY_MASK.store(windows_keys, Ordering::Release);
+        }
+        let passed_through_windows_keys = PASSED_THROUGH_WINDOWS_KEY_MASK.load(Ordering::Acquire);
+        if crate::windows_policy::should_forward_windows_key_up(
+            passed_through_windows_keys,
+            data.vkCode,
+            key_up,
+        ) {
+            PASSED_THROUGH_WINDOWS_KEY_MASK.store(
+                crate::windows_policy::next_windows_key_mask(
+                    passed_through_windows_keys,
+                    data.vkCode,
+                    false,
+                    true,
+                ),
+                Ordering::Release,
+            );
+            return CallNextHookEx(null_mut(), code, wparam, lparam);
+        }
         if crate::windows_policy::should_trigger_transparent_lock(
             WIN_L_ENABLED.load(Ordering::Acquire),
             LOCKED.load(Ordering::Relaxed),
             data.vkCode,
-            windows_key_down,
+            windows_keys != 0,
             key_down,
         ) {
             let manager = MANAGER_WINDOW.load(Ordering::Acquire) as HWND;
@@ -1509,6 +1538,17 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
             LOCKED.load(Ordering::Relaxed),
             HELLO_IN_PROGRESS.load(Ordering::Acquire),
         ) {
+            if key_down {
+                PASSED_THROUGH_WINDOWS_KEY_MASK.store(
+                    crate::windows_policy::next_windows_key_mask(
+                        passed_through_windows_keys,
+                        data.vkCode,
+                        true,
+                        false,
+                    ),
+                    Ordering::Release,
+                );
+            }
             return CallNextHookEx(null_mut(), code, wparam, lparam);
         }
         if key_down && WINDOWS_HELLO_ENABLED.load(Ordering::Acquire) {

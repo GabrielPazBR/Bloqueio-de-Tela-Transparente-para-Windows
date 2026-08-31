@@ -6,7 +6,7 @@ Feito por Gabriel Paz.
 
 ## Versão atual
 
-**6.3** (`0.6.3`)
+**6.6** (`0.6.6`)
 
 ## Recursos
 
@@ -44,7 +44,7 @@ Na primeira execução:
 
 Após a instalação, o aplicativo será iniciado automaticamente com o Windows. Ao abrir o instalador novamente, será possível abrir as configurações, atualizar ou desinstalar a versão existente.
 
-Para atualizar uma instalação anterior, abra o instalador 6.3 da mesma arquitetura e escolha **Atualizar**.
+Para atualizar uma instalação anterior, abra o instalador 6.6 da mesma arquitetura e escolha **Atualizar**.
 
 ## Uso
 
@@ -69,11 +69,27 @@ Com o Windows Hello ativado, mover o mouse ou pressionar uma tecla abre a confir
 
 Se a janela de senha ou a confirmação do Windows Hello ficar 15 segundos sem atividade, ela será fechada sem desbloquear a tela. Uma nova entrada abre a confirmação novamente.
 
+## Alterações da versão 6.6
+
+- O evento de liberação da tecla Windows chega ao sistema após um bloqueio iniciado por `Win + L`, evitando que o modificador permaneça pressionado.
+- O relógio e a data do widget ficam brancos em 0% de transparência.
+
+## Alterações da versão 6.5
+
+- A ativação do Windows Hello é executada fora da thread da interface, evitando falha de inicialização e travamento do botão.
+- O botão fica desabilitado enquanto a confirmação do Windows Hello estiver aberta.
+
+## Alterações da versão 6.4
+
+- `Win + L` usa os eventos do hook para rastrear as teclas Windows e acionar o bloqueio transparente de forma consistente.
+
 ## Alterações da versão 6.3
 
 - O controle do widget agora representa transparência: 0% mantém as letras brancas e 100% deixa o widget invisível.
 - O texto do controle foi alterado de **Opacidade** para **Transparência**.
-- Novas configurações usam 0% de transparência por padrão.
+- Novas configurações usam 15% de transparência e ocultam a barra de tarefas por padrão.
+- A tela de aparência mostra uma prévia do logotipo de desbloqueio selecionado.
+- A ativação do Windows Hello funciona quando a janela de configurações já inicializou o componente de interface do Windows.
 
 ## Alterações da versão 6.2
 

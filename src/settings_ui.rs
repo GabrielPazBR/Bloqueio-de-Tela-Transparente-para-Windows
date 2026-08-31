@@ -13,6 +13,26 @@ pub enum WidgetSizePreset {
     ExtraLarge,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsHelloButtonAction {
+    StartVerification,
+    Disable,
+    Wait,
+}
+
+pub const fn windows_hello_button_action(
+    currently_enabled: bool,
+    verification_in_progress: bool,
+) -> WindowsHelloButtonAction {
+    if verification_in_progress {
+        WindowsHelloButtonAction::Wait
+    } else if currently_enabled {
+        WindowsHelloButtonAction::Disable
+    } else {
+        WindowsHelloButtonAction::StartVerification
+    }
+}
+
 impl WidgetSizePreset {
     pub const ALL: [Self; 5] = [
         Self::ExtraSmall,

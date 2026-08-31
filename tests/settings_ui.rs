@@ -2,6 +2,7 @@ use bloqueio_transparente::config::{Hotkey, WidgetConfig, WidgetKind};
 use bloqueio_transparente::protocol::ClientRequest;
 use bloqueio_transparente::settings_ui::{
     ProtectionStatus, SettingsInputError, SettingsModel, WidgetSizePreset,
+    WindowsHelloButtonAction, windows_hello_button_action,
 };
 
 #[test]
@@ -54,6 +55,22 @@ fn windows_hello_toggle_is_authenticated_with_the_app_password() {
     };
     assert_eq!(current.expose(), "senha");
     assert!(enabled);
+}
+
+#[test]
+fn windows_hello_button_starts_one_non_blocking_verification_at_a_time() {
+    assert_eq!(
+        windows_hello_button_action(false, false),
+        WindowsHelloButtonAction::StartVerification
+    );
+    assert_eq!(
+        windows_hello_button_action(false, true),
+        WindowsHelloButtonAction::Wait
+    );
+    assert_eq!(
+        windows_hello_button_action(true, false),
+        WindowsHelloButtonAction::Disable
+    );
 }
 
 #[test]

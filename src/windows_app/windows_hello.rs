@@ -6,7 +6,7 @@ use std::time::Duration;
 use windows::Security::Credentials::UI::{
     UserConsentVerificationResult, UserConsentVerifier, UserConsentVerifierAvailability,
 };
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, RPC_E_CHANGED_MODE};
 use windows::Win32::System::WinRT::{
     IUserConsentVerifierInterop, RO_INIT_MULTITHREADED, RoGetActivationFactory, RoInitialize,
     RoUninitialize,
@@ -37,19 +37,29 @@ impl VerificationCancellation {
     }
 }
 
-struct WinRtApartment;
+struct WinRtApartment {
+    initialized_here: bool,
+}
 
 impl WinRtApartment {
     fn initialize() -> Result<Self> {
-        unsafe { RoInitialize(RO_INIT_MULTITHREADED) }
-            .context("não foi possível inicializar o Windows Hello")?;
-        Ok(Self)
+        match unsafe { RoInitialize(RO_INIT_MULTITHREADED) } {
+            Ok(()) => Ok(Self {
+                initialized_here: true,
+            }),
+            Err(error) if error.code() == RPC_E_CHANGED_MODE => Ok(Self {
+                initialized_here: false,
+            }),
+            Err(error) => Err(error).context("não foi possível inicializar o Windows Hello"),
+        }
     }
 }
 
 impl Drop for WinRtApartment {
     fn drop(&mut self) {
-        unsafe { RoUninitialize() };
+        if self.initialized_here {
+            unsafe { RoUninitialize() };
+        }
     }
 }
 
@@ -59,11 +69,6 @@ pub fn availability() -> Result<UserConsentVerifierAvailability> {
         .context("não foi possível consultar o Windows Hello")?
         .get()
         .context("não foi possível consultar o Windows Hello")
-}
-
-pub fn verify_for_window(owner: HWND, message: &str) -> Result<UserConsentVerificationResult> {
-    let (_sender, receiver) = mpsc::channel();
-    verify_for_window_cancelable(owner, message, receiver)
 }
 
 fn verify_for_window_cancelable(
@@ -123,6 +128,48 @@ where
     let worker_requested = requested.clone();
     crate::background::run(
         move || {
+            let owner = HWND(owner as *mut std::ffi::c_void);
+            match verify_for_window_cancelable(owner, &message, receiver) {
+                Ok(UserConsentVerificationResult::Verified) => VerificationOutcome::Verified,
+                Ok(UserConsentVerificationResult::Canceled) => VerificationOutcome::Canceled,
+                Ok(value) => VerificationOutcome::Rejected(verification_message(value).to_owned()),
+                Err(_) if worker_requested.load(Ordering::Acquire) => VerificationOutcome::Canceled,
+                Err(error) => VerificationOutcome::Rejected(error.to_string()),
+            }
+        },
+        complete,
+    );
+    VerificationCancellation {
+        sender: Some(sender),
+        requested,
+    }
+}
+
+pub fn verify_activation_for_window_async<F>(
+    owner: isize,
+    message: String,
+    complete: F,
+) -> VerificationCancellation
+where
+    F: FnOnce(VerificationOutcome) + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    let requested = Arc::new(AtomicBool::new(false));
+    let worker_requested = requested.clone();
+    crate::background::run(
+        move || {
+            let availability = match availability() {
+                Ok(value) => value,
+                Err(error) => return VerificationOutcome::Rejected(error.to_string()),
+            };
+            if availability != UserConsentVerifierAvailability::Available {
+                return VerificationOutcome::Rejected(
+                    availability_message(availability).to_owned(),
+                );
+            }
+            if worker_requested.load(Ordering::Acquire) {
+                return VerificationOutcome::Canceled;
+            }
             let owner = HWND(owner as *mut std::ffi::c_void);
             match verify_for_window_cancelable(owner, &message, receiver) {
                 Ok(UserConsentVerificationResult::Verified) => VerificationOutcome::Verified,

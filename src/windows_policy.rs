@@ -87,6 +87,40 @@ pub fn should_trigger_transparent_lock(
     replacement_enabled && !locked && virtual_key == 0x4c && windows_key_down && key_down
 }
 
+pub const fn next_windows_key_mask(
+    current: u8,
+    virtual_key: u32,
+    key_down: bool,
+    key_up: bool,
+) -> u8 {
+    let bit = windows_key_bit(virtual_key);
+    if bit == 0 {
+        current
+    } else if key_down {
+        current | bit
+    } else if key_up {
+        current & !bit
+    } else {
+        current
+    }
+}
+
+pub const fn should_forward_windows_key_up(
+    passed_through_mask: u8,
+    virtual_key: u32,
+    key_up: bool,
+) -> bool {
+    key_up && passed_through_mask & windows_key_bit(virtual_key) != 0
+}
+
+const fn windows_key_bit(virtual_key: u32) -> u8 {
+    match virtual_key {
+        0x5b => 1,
+        0x5c => 2,
+        _ => 0,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MonitorRect {
     pub left: i32,
@@ -130,6 +164,10 @@ pub const fn apply_widget_opacity(channel: u8, opacity_percentage: u8) -> u8 {
     };
     let visibility = 100 - bounded;
     ((channel as u16 * visibility as u16 + 50) / 100) as u8
+}
+
+pub const fn widget_text_channel(transparency_percentage: u8) -> u8 {
+    apply_widget_opacity(255, transparency_percentage)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
