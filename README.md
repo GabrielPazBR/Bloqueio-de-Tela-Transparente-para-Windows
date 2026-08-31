@@ -6,7 +6,7 @@ Feito por Gabriel Paz.
 
 ## Versão atual
 
-**6.7** (`0.6.7`)
+**6.8** (`0.6.8`)
 
 ## Recursos
 
@@ -44,7 +44,7 @@ Na primeira execução:
 
 Após a instalação, o aplicativo será iniciado automaticamente com o Windows. Ao abrir o instalador novamente, será possível abrir as configurações, atualizar ou desinstalar a versão existente.
 
-Para atualizar uma instalação anterior, abra o instalador 6.7 da mesma arquitetura e escolha **Atualizar**.
+Para atualizar uma instalação anterior, abra o instalador 6.8 da mesma arquitetura e escolha **Atualizar**.
 
 ## Uso
 
@@ -68,6 +68,12 @@ Com o Windows Hello desativado, a primeira tecla imprimível abre o campo de sen
 Com o Windows Hello ativado, mover o mouse ou pressionar uma tecla abre a confirmação nativa do Windows. O teclado e o leitor biométrico ficam livres enquanto essa confirmação estiver aberta. A senha do app não é aceita para desbloquear, mas continua protegendo as configurações.
 
 Se a janela de senha ou a confirmação do Windows Hello ficar 15 segundos sem atividade, ela será fechada sem desbloquear a tela. Uma nova entrada abre a confirmação novamente.
+
+## Alterações da versão 6.8
+
+- Os hooks só bloqueiam entrada enquanto uma cobertura de bloqueio válida está visível.
+- A recuperação de um agente travado usa o bloqueio do Windows em vez de reinstalar hooks com um estado antigo.
+- Falhas do agente durante o bloqueio não deixam mais teclado e mouse presos na área de trabalho.
 
 ## Alterações da versão 6.7
 

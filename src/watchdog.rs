@@ -34,8 +34,10 @@ impl Watchdog {
     pub fn tick(&mut self, now: Instant) -> Option<WatchdogAction> {
         if now.duration_since(self.last_heartbeat) >= HEARTBEAT_TIMEOUT {
             self.last_heartbeat = now;
-            Some(WatchdogAction::RestartAgent {
-                locked: self.locked,
+            Some(if self.locked {
+                WatchdogAction::LockWindows
+            } else {
+                WatchdogAction::RestartAgent { locked: false }
             })
         } else {
             None
@@ -43,6 +45,10 @@ impl Watchdog {
     }
 
     pub fn agent_failed(&mut self, now: Instant) -> WatchdogAction {
+        if self.locked {
+            self.failures.clear();
+            return WatchdogAction::LockWindows;
+        }
         while self
             .failures
             .front()
@@ -55,9 +61,7 @@ impl Watchdog {
             self.failures.clear();
             WatchdogAction::LockWindows
         } else {
-            WatchdogAction::RestartAgent {
-                locked: self.locked,
-            }
+            WatchdogAction::RestartAgent { locked: false }
         }
     }
 }

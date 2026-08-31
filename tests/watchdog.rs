@@ -2,7 +2,7 @@ use bloqueio_transparente::watchdog::{Watchdog, WatchdogAction};
 use std::time::{Duration, Instant};
 
 #[test]
-fn missing_heartbeat_for_six_seconds_restarts_the_agent_locked() {
+fn missing_heartbeat_while_locked_uses_the_windows_lock() {
     let start = Instant::now();
     let mut watchdog = Watchdog::new(start);
     watchdog.heartbeat(start, true);
@@ -10,8 +10,17 @@ fn missing_heartbeat_for_six_seconds_restarts_the_agent_locked() {
     assert_eq!(watchdog.tick(start + Duration::from_secs(5)), None);
     assert_eq!(
         watchdog.tick(start + Duration::from_secs(6)),
-        Some(WatchdogAction::RestartAgent { locked: true })
+        Some(WatchdogAction::LockWindows)
     );
+}
+
+#[test]
+fn locked_agent_failure_uses_the_windows_lock_instead_of_reinstalling_hooks() {
+    let start = Instant::now();
+    let mut watchdog = Watchdog::new(start);
+    watchdog.heartbeat(start, true);
+
+    assert_eq!(watchdog.agent_failed(start), WatchdogAction::LockWindows);
 }
 
 #[test]

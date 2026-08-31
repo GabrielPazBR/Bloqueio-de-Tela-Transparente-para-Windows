@@ -40,6 +40,7 @@ const WIDGET_TRANSPARENT_COLOR: COLORREF = 0x00030201;
 
 static RUNTIME: OnceLock<Mutex<AgentRuntime>> = OnceLock::new();
 static LOCKED: AtomicBool = AtomicBool::new(false);
+static LOCK_SURFACE: AtomicIsize = AtomicIsize::new(0);
 static WINDOWS_HELLO_ENABLED: AtomicBool = AtomicBool::new(false);
 static WIN_L_ENABLED: AtomicBool = AtomicBool::new(false);
 static WINDOWS_KEY_MASK: AtomicU8 = AtomicU8::new(0);
@@ -670,6 +671,10 @@ fn create_overlays() -> Result<()> {
             InvalidateRect(widget_window, null(), 0);
         }
     }
+    LOCK_SURFACE.store(
+        runtime.overlays.first().copied().unwrap_or(null_mut()) as isize,
+        Ordering::Release,
+    );
     LOCKED.store(true, Ordering::SeqCst);
     Ok(())
 }
@@ -687,6 +692,10 @@ fn rebuild_overlays() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("estado indisponível"))?;
     let previous = std::mem::replace(&mut runtime.overlays, windows);
     let previous_widgets = std::mem::replace(&mut runtime.widget_overlays, widget_windows);
+    LOCK_SURFACE.store(
+        runtime.overlays.first().copied().unwrap_or(null_mut()) as isize,
+        Ordering::Release,
+    );
     destroy_window_list(&previous);
     destroy_window_list(&previous_widgets);
     let target = if runtime.prompt.is_null() {
@@ -715,6 +724,7 @@ fn rebuild_overlays() -> Result<()> {
 
 fn destroy_overlays() {
     LOCKED.store(false, Ordering::SeqCst);
+    LOCK_SURFACE.store(0, Ordering::Release);
     WINDOWS_HELLO_ENABLED.store(false, Ordering::Release);
     HELLO_IN_PROGRESS.store(false, Ordering::Release);
     HELLO_REQUEST_PENDING.store(false, Ordering::Release);
@@ -1518,6 +1528,7 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
         if code >= 0
             && crate::windows_policy::should_block_lock_input(
                 LOCKED.load(Ordering::Relaxed),
+                lock_surface_is_visible(),
                 HELLO_IN_PROGRESS.load(Ordering::Acquire),
             )
         {
@@ -1579,6 +1590,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
         }
         if !crate::windows_policy::should_block_lock_input(
             LOCKED.load(Ordering::Relaxed),
+            lock_surface_is_visible(),
             HELLO_IN_PROGRESS.load(Ordering::Acquire),
         ) {
             if key_down {
@@ -1642,6 +1654,11 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
             KeyDecision::PassThrough => CallNextHookEx(null_mut(), code, wparam, lparam),
         }
     }
+}
+
+fn lock_surface_is_visible() -> bool {
+    let surface = LOCK_SURFACE.load(Ordering::Acquire) as HWND;
+    !surface.is_null() && unsafe { IsWindowVisible(surface) } != 0
 }
 
 unsafe fn post_windows_hello_request() {

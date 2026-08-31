@@ -82,8 +82,12 @@ pub fn should_enforce_lock_foreground(locked: bool, windows_hello_in_progress: b
     locked && !windows_hello_in_progress
 }
 
-pub fn should_block_lock_input(locked: bool, windows_hello_in_progress: bool) -> bool {
-    locked && !windows_hello_in_progress
+pub fn should_block_lock_input(
+    locked: bool,
+    lock_surface_visible: bool,
+    windows_hello_in_progress: bool,
+) -> bool {
+    locked && lock_surface_visible && !windows_hello_in_progress
 }
 
 pub fn should_suspend_hooks_for_windows_hello(win_l_replacement_enabled: bool) -> bool {

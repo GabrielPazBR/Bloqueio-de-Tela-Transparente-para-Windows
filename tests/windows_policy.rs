@@ -252,9 +252,10 @@ fn transparent_window_does_not_reclaim_focus_during_windows_hello() {
 fn input_hooks_release_events_while_windows_hello_is_open() {
     use bloqueio_transparente::windows_policy::should_block_lock_input;
 
-    assert!(should_block_lock_input(true, false));
-    assert!(!should_block_lock_input(true, true));
-    assert!(!should_block_lock_input(false, false));
+    assert!(should_block_lock_input(true, true, false));
+    assert!(!should_block_lock_input(true, true, true));
+    assert!(!should_block_lock_input(false, true, false));
+    assert!(!should_block_lock_input(true, false, false));
 }
 
 #[test]
