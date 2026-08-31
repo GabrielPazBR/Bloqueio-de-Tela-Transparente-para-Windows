@@ -1,7 +1,8 @@
 use bloqueio_transparente::windows_policy::{
-    ClockWidgetLayout, ImageLayout, KeyDecision, KeyEvent, MonitorRect, OverlayLayout, TrayAction,
-    TrayMenuAction, VirtualKey, WidgetLayout, clock_date_label, dimming_alpha,
-    should_quit_on_window_destroy, tray_action, tray_menu_action, trusted_agent_process,
+    ClockWidgetLayout, ImageLayout, KeyDecision, KeyEvent, LayeredSurface, MonitorRect,
+    OverlayLayout, TrayAction, TrayMenuAction, VirtualKey, WidgetLayout, clock_date_label,
+    dimming_alpha, layered_surface_alpha, should_quit_on_window_destroy, tray_action,
+    tray_menu_action, trusted_agent_process,
 };
 use std::time::Duration;
 
@@ -98,8 +99,20 @@ fn dimming_percentage_maps_to_layered_window_alpha() {
 }
 
 #[test]
+fn widget_surface_stays_opaque_independently_from_screen_dimming() {
+    assert_eq!(layered_surface_alpha(LayeredSurface::Dimming, 0), 1);
+    assert_eq!(layered_surface_alpha(LayeredSurface::Dimming, 75), 191);
+    assert_eq!(layered_surface_alpha(LayeredSurface::Widget, 0), 255);
+    assert_eq!(layered_surface_alpha(LayeredSurface::Widget, 75), 255);
+    assert_eq!(layered_surface_alpha(LayeredSurface::Widget, 100), 255);
+}
+
+#[test]
 fn widget_transparency_fades_a_color_channel_as_the_slider_increases() {
-    use bloqueio_transparente::windows_policy::{apply_widget_opacity, widget_text_channel};
+    use bloqueio_transparente::windows_policy::{
+        apply_widget_opacity, blend_channel_over_background, unlock_logo_channel,
+        widget_text_channel,
+    };
 
     assert_eq!(apply_widget_opacity(255, 0), 255);
     assert_eq!(apply_widget_opacity(255, 40), 153);
@@ -108,6 +121,11 @@ fn widget_transparency_fades_a_color_channel_as_the_slider_increases() {
     assert_eq!(widget_text_channel(0), 255);
     assert_eq!(widget_text_channel(40), 153);
     assert_eq!(widget_text_channel(100), 0);
+    assert_eq!(unlock_logo_channel(0), 0);
+    assert_eq!(unlock_logo_channel(127), 127);
+    assert_eq!(unlock_logo_channel(255), 255);
+    assert_eq!(blend_channel_over_background(255, 20, 0), 20);
+    assert_eq!(blend_channel_over_background(255, 20, 255), 255);
 }
 
 #[test]

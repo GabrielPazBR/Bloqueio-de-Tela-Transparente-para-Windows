@@ -6,7 +6,7 @@ Feito por Gabriel Paz.
 
 ## Versão atual
 
-**6.6** (`0.6.6`)
+**6.7** (`0.6.7`)
 
 ## Recursos
 
@@ -44,7 +44,7 @@ Na primeira execução:
 
 Após a instalação, o aplicativo será iniciado automaticamente com o Windows. Ao abrir o instalador novamente, será possível abrir as configurações, atualizar ou desinstalar a versão existente.
 
-Para atualizar uma instalação anterior, abra o instalador 6.6 da mesma arquitetura e escolha **Atualizar**.
+Para atualizar uma instalação anterior, abra o instalador 6.7 da mesma arquitetura e escolha **Atualizar**.
 
 ## Uso
 
@@ -68,6 +68,12 @@ Com o Windows Hello desativado, a primeira tecla imprimível abre o campo de sen
 Com o Windows Hello ativado, mover o mouse ou pressionar uma tecla abre a confirmação nativa do Windows. O teclado e o leitor biométrico ficam livres enquanto essa confirmação estiver aberta. A senha do app não é aceita para desbloquear, mas continua protegendo as configurações.
 
 Se a janela de senha ou a confirmação do Windows Hello ficar 15 segundos sem atividade, ela será fechada sem desbloquear a tela. Uma nova entrada abre a confirmação novamente.
+
+## Alterações da versão 6.7
+
+- O relógio usa uma superfície independente e permanece branco em 0% de transparência, sem ser afetado pelo escurecimento da tela.
+- A superfície do relógio é limpa antes de cada atualização, evitando a sobreposição dos horários.
+- A logo de desbloqueio preserva suas cores e compõe corretamente áreas transparentes sobre a janela.
 
 ## Alterações da versão 6.6
 

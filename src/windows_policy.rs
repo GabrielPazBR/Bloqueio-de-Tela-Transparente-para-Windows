@@ -55,6 +55,19 @@ pub fn dimming_alpha(percent: u8) -> u8 {
     (((u16::from(percent.min(100)) * 255) + 50) / 100).max(1) as u8
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayeredSurface {
+    Dimming,
+    Widget,
+}
+
+pub fn layered_surface_alpha(surface: LayeredSurface, dimming_percentage: u8) -> u8 {
+    match surface {
+        LayeredSurface::Dimming => dimming_alpha(dimming_percentage),
+        LayeredSurface::Widget => u8::MAX,
+    }
+}
+
 pub fn inactivity_lock_due(
     timeout_minutes: u16,
     idle_duration: std::time::Duration,
@@ -168,6 +181,16 @@ pub const fn apply_widget_opacity(channel: u8, opacity_percentage: u8) -> u8 {
 
 pub const fn widget_text_channel(transparency_percentage: u8) -> u8 {
     apply_widget_opacity(255, transparency_percentage)
+}
+
+pub const fn unlock_logo_channel(channel: u8) -> u8 {
+    channel
+}
+
+pub const fn blend_channel_over_background(channel: u8, background: u8, alpha: u8) -> u8 {
+    let foreground = channel as u32 * alpha as u32;
+    let background = background as u32 * (u8::MAX - alpha) as u32;
+    ((foreground + background + 127) / 255) as u8
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

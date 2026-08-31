@@ -2,8 +2,8 @@ use super::{DISPLAY_NAME, ipc};
 use crate::lock::{Action, Event, LockController, LockState, UnlockMethod};
 use crate::protocol::{ClientRequest, ServiceResponse};
 use crate::windows_policy::{
-    ClockWidgetLayout, ImageLayout, KeyDecision, KeyEvent, MonitorRect, OverlayLayout, VirtualKey,
-    clock_date_label, dimming_alpha,
+    ClockWidgetLayout, ImageLayout, KeyDecision, KeyEvent, LayeredSurface, MonitorRect,
+    OverlayLayout, VirtualKey, clock_date_label, layered_surface_alpha,
 };
 use anyhow::{Context, Result, bail};
 use std::mem::zeroed;
@@ -36,6 +36,7 @@ const MENU_LOCK: usize = 1001;
 const MENU_SETTINGS: usize = 1002;
 const MENU_STATUS: usize = 1003;
 const MENU_SHUTDOWN: usize = 1004;
+const WIDGET_TRANSPARENT_COLOR: COLORREF = 0x00030201;
 
 static RUNTIME: OnceLock<Mutex<AgentRuntime>> = OnceLock::new();
 static LOCKED: AtomicBool = AtomicBool::new(false);
@@ -53,6 +54,7 @@ struct AgentRuntime {
     controller: LockController,
     manager: HWND,
     overlays: Vec<HWND>,
+    widget_overlays: Vec<HWND>,
     prompt: HWND,
     hooks: Option<HookThread>,
     last_heartbeat: Instant,
@@ -145,6 +147,7 @@ pub fn run(start_locked: bool) -> Result<()> {
             controller: LockController::new(),
             manager,
             overlays: Vec::new(),
+            widget_overlays: Vec::new(),
             prompt: null_mut(),
             hooks: None,
             last_heartbeat: Instant::now(),
@@ -519,14 +522,14 @@ fn clear_prompt_activity_tracking() {
     }
 }
 
-fn build_overlay_windows() -> Result<Vec<HWND>> {
+fn build_overlay_windows(widget: &crate::config::WidgetConfig) -> Result<(Vec<HWND>, Vec<HWND>)> {
     let dimming_percentage = match ipc::send_current_session(&ClientRequest::Settings) {
         Ok(ServiceResponse::Settings {
             dimming_percentage, ..
         }) => dimming_percentage,
         _ => 0,
     };
-    let alpha = dimming_alpha(dimming_percentage);
+    let alpha = layered_surface_alpha(LayeredSurface::Dimming, dimming_percentage);
     let monitors = enumerate_monitors()?;
     let layouts = OverlayLayout::from_monitors(&monitors);
     let class_name = wide(CLASS_NAME);
@@ -569,7 +572,55 @@ fn build_overlay_windows() -> Result<Vec<HWND>> {
         }
         windows.push(window);
     }
-    Ok(windows)
+    let mut widget_windows = Vec::new();
+    if widget.kind != crate::config::WidgetKind::None
+        && let Some(monitor) = crate::windows_policy::central_monitor(&monitors)
+    {
+        let window = unsafe {
+            CreateWindowExW(
+                WS_EX_LAYERED
+                    | WS_EX_TOPMOST
+                    | WS_EX_TOOLWINDOW
+                    | WS_EX_TRANSPARENT
+                    | WS_EX_NOACTIVATE,
+                class_name.as_ptr(),
+                title.as_ptr(),
+                WS_POPUP,
+                monitor.left,
+                monitor.top,
+                monitor.right - monitor.left,
+                monitor.bottom - monitor.top,
+                null_mut(),
+                null_mut(),
+                instance,
+                null(),
+            )
+        };
+        if window.is_null() {
+            destroy_window_list(&windows);
+            bail!("não foi possível criar a superfície do widget");
+        }
+        unsafe {
+            SetLayeredWindowAttributes(
+                window,
+                WIDGET_TRANSPARENT_COLOR,
+                layered_surface_alpha(LayeredSurface::Widget, dimming_percentage),
+                LWA_COLORKEY | LWA_ALPHA,
+            );
+            ShowWindow(window, SW_SHOWNOACTIVATE);
+            SetWindowPos(
+                window,
+                HWND_TOPMOST,
+                monitor.left,
+                monitor.top,
+                monitor.right - monitor.left,
+                monitor.bottom - monitor.top,
+                SWP_SHOWWINDOW | SWP_NOACTIVATE,
+            );
+        }
+        widget_windows.push(window);
+    }
+    Ok((windows, widget_windows))
 }
 
 fn create_overlays() -> Result<()> {
@@ -583,16 +634,18 @@ fn create_overlays() -> Result<()> {
             }) => (widget, hide_taskbar_on_lock, unlock_logo_path),
             _ => (crate::config::WidgetConfig::default(), false, None),
         };
-    let windows = build_overlay_windows()?;
+    let (windows, widget_windows) = build_overlay_windows(&widget)?;
     let runtime = RUNTIME.get().context("agente não inicializado")?;
     let mut runtime = runtime
         .lock()
         .map_err(|_| anyhow::anyhow!("estado indisponível"))?;
     let previous = std::mem::replace(&mut runtime.overlays, windows);
+    let previous_widgets = std::mem::replace(&mut runtime.widget_overlays, widget_windows);
     runtime.widget = widget;
     runtime.hide_taskbar_on_lock = hide_taskbar_on_lock;
     runtime.unlock_logo_path = unlock_logo_path;
     destroy_window_list(&previous);
+    destroy_window_list(&previous_widgets);
     restore_taskbars(&mut runtime.hidden_taskbars);
     if runtime.hide_taskbar_on_lock {
         runtime.hidden_taskbars = hide_taskbars();
@@ -603,18 +656,39 @@ fn create_overlays() -> Result<()> {
             SetFocus(first);
         }
     }
+    for &widget_window in &runtime.widget_overlays {
+        unsafe {
+            SetWindowPos(
+                widget_window,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE,
+            );
+            InvalidateRect(widget_window, null(), 0);
+        }
+    }
     LOCKED.store(true, Ordering::SeqCst);
     Ok(())
 }
 
 fn rebuild_overlays() -> Result<()> {
-    let windows = build_overlay_windows()?;
     let runtime = RUNTIME.get().context("agente não inicializado")?;
+    let widget = runtime
+        .lock()
+        .map_err(|_| anyhow::anyhow!("estado indisponível"))?
+        .widget
+        .clone();
+    let (windows, widget_windows) = build_overlay_windows(&widget)?;
     let mut runtime = runtime
         .lock()
         .map_err(|_| anyhow::anyhow!("estado indisponível"))?;
     let previous = std::mem::replace(&mut runtime.overlays, windows);
+    let previous_widgets = std::mem::replace(&mut runtime.widget_overlays, widget_windows);
     destroy_window_list(&previous);
+    destroy_window_list(&previous_widgets);
     let target = if runtime.prompt.is_null() {
         runtime.overlays.first().copied()
     } else {
@@ -649,6 +723,8 @@ fn destroy_overlays() {
     {
         destroy_window_list(&runtime.overlays);
         runtime.overlays.clear();
+        destroy_window_list(&runtime.widget_overlays);
+        runtime.widget_overlays.clear();
         restore_taskbars(&mut runtime.hidden_taskbars);
         if !runtime.prompt.is_null() {
             unsafe { DestroyWindow(runtime.prompt) };
@@ -809,89 +885,30 @@ fn paint_window(window: HWND) {
         .map(|runtime| {
             (
                 runtime.prompt == window,
+                runtime.widget_overlays.contains(&window),
                 runtime.widget.clone(),
                 runtime.unlock_logo_path.clone(),
             )
         });
     let is_prompt = appearance.as_ref().is_some_and(|value| value.0);
     if is_prompt {
-        let logo_path = appearance.as_ref().and_then(|value| value.2.as_deref());
+        let logo_path = appearance.as_ref().and_then(|value| value.3.as_deref());
         paint_unlock_prompt(dc, logo_path);
         unsafe { EndPaint(window, &paint) };
         return;
     }
-    if is_prompt {
+    let is_widget = appearance.as_ref().is_some_and(|value| value.1);
+    if is_widget {
         let mut rect: RECT = unsafe { zeroed() };
         unsafe {
             GetClientRect(window, &mut rect);
-            SetBkColor(dc, 0x00202020);
-            SetTextColor(dc, 0x00ffffff);
-            let brush = CreateSolidBrush(0x00202020);
+            let brush = CreateSolidBrush(WIDGET_TRANSPARENT_COLOR);
             FillRect(dc, &rect, brush);
             DeleteObject(brush);
         }
-        let (message, count, failed, retry_after) = RUNTIME
-            .get()
-            .and_then(|runtime| runtime.lock().ok())
-            .map(|runtime| {
-                (
-                    runtime.unlock_message.clone(),
-                    runtime.controller.password_buffer().chars().count(),
-                    runtime.controller.failed_attempts() > 0,
-                    runtime.controller.retry_at().map(|deadline| {
-                        deadline
-                            .saturating_duration_since(Instant::now())
-                            .as_secs()
-                            .max(1)
-                    }),
-                )
-            })
-            .unwrap_or_default();
-        let logo_path = appearance.as_ref().and_then(|value| value.2.as_deref());
-        if let Some(path) = logo_path {
-            draw_image(dc, path, 232, 12, 96, 64);
+        if let Some((_, _, widget, _)) = appearance {
+            paint_widget(window, dc, &widget);
         }
-        let label = wide(&message);
-        let bullets = wide(&"●".repeat(count));
-        unsafe {
-            let mut label_rect = RECT {
-                left: 24,
-                top: if logo_path.is_some() { 82 } else { 20 },
-                right: 536,
-                bottom: 74,
-            };
-            DrawTextW(
-                dc,
-                label.as_ptr(),
-                (label.len() - 1) as i32,
-                &mut label_rect,
-                DT_CENTER | DT_WORDBREAK,
-            );
-            let field_y = if logo_path.is_some() { 148 } else { 86 };
-            TextOutW(
-                dc,
-                24,
-                field_y,
-                bullets.as_ptr(),
-                (bullets.len() - 1) as i32,
-            );
-            if failed {
-                let error = wide(&retry_after.map_or_else(
-                    || "Senha incorreta".into(),
-                    |seconds| format!("Tente novamente em {seconds} s"),
-                ));
-                SetTextColor(dc, 0x006060ff);
-                TextOutW(
-                    dc,
-                    24,
-                    field_y + 46,
-                    error.as_ptr(),
-                    (error.len() - 1) as i32,
-                );
-            }
-        }
-    } else if let Some((_, widget, _)) = appearance {
-        paint_widget(window, dc, &widget);
     }
     unsafe { EndPaint(window, &paint) };
 }
@@ -1323,7 +1340,7 @@ fn draw_clock_text(
 }
 
 fn draw_image(dc: HDC, path: &str, x: i32, y: i32, width: i32, height: i32) {
-    draw_image_with_opacity(dc, path, x, y, width, height, 100);
+    draw_image_pixels(dc, path, x, y, width, height, 0, Some([20, 22, 25]));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1336,6 +1353,20 @@ fn draw_image_with_opacity(
     height: i32,
     opacity_percentage: u8,
 ) {
+    draw_image_pixels(dc, path, x, y, width, height, opacity_percentage, None);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_image_pixels(
+    dc: HDC,
+    path: &str,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    opacity_percentage: u8,
+    background: Option<[u8; 3]>,
+) {
     let Ok(image) = image::open(path).map(|image| image.to_rgba8()) else {
         return;
     };
@@ -1346,10 +1377,22 @@ fn draw_image_with_opacity(
     };
     let mut pixels = image.into_raw();
     for pixel in pixels.as_chunks_mut::<4>().0 {
+        if let Some(background) = background {
+            let alpha = pixel[3];
+            for channel in 0..3 {
+                pixel[channel] = crate::windows_policy::blend_channel_over_background(
+                    crate::windows_policy::unlock_logo_channel(pixel[channel]),
+                    background[channel],
+                    alpha,
+                );
+            }
+            pixel[3] = u8::MAX;
+        } else {
+            pixel[0] = crate::windows_policy::apply_widget_opacity(pixel[0], opacity_percentage);
+            pixel[1] = crate::windows_policy::apply_widget_opacity(pixel[1], opacity_percentage);
+            pixel[2] = crate::windows_policy::apply_widget_opacity(pixel[2], opacity_percentage);
+        }
         pixel.swap(0, 2);
-        pixel[0] = crate::windows_policy::apply_widget_opacity(pixel[0], opacity_percentage);
-        pixel[1] = crate::windows_policy::apply_widget_opacity(pixel[1], opacity_percentage);
-        pixel[2] = crate::windows_policy::apply_widget_opacity(pixel[2], opacity_percentage);
     }
     let mut info: BITMAPINFO = unsafe { zeroed() };
     info.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
@@ -1696,11 +1739,24 @@ fn timer_tick() {
             if !is_own_foreground() {
                 SetForegroundWindow(target);
             }
+            if runtime.prompt.is_null() {
+                for &widget_window in &runtime.widget_overlays {
+                    SetWindowPos(
+                        widget_window,
+                        HWND_TOPMOST,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
+            }
             if !runtime.prompt.is_null() {
                 InvalidateRect(runtime.prompt, null(), 1);
             } else if runtime.widget.kind == crate::config::WidgetKind::Clock {
-                for &overlay in &runtime.overlays {
-                    InvalidateRect(overlay, null(), 0);
+                for &widget_window in &runtime.widget_overlays {
+                    InvalidateRect(widget_window, null(), 0);
                 }
             }
         }
