@@ -137,7 +137,7 @@ impl eframe::App for MaintenanceApp {
                         if ui
                             .add_sized(
                                 [ui.available_width(), 42.0],
-                                egui::Button::new("Restaurar instalação"),
+                                egui::Button::new("Reparar instalação"),
                             )
                             .clicked()
                         {

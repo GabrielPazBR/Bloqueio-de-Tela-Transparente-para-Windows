@@ -6,7 +6,24 @@ Feito por Gabriel Paz.
 
 ## Versão atual
 
-**6.8** (`0.6.8`)
+**7.0** (`0.7.0`)
+
+## Alterações da versão 7.0
+
+- Instalador dedicado, separado do aplicativo, com instalação, atualização, reparação e desinstalação.
+- Atualização e reparação preservam senha e configurações existentes.
+- Cópia do instalador em Program Files para reparar arquivos ausentes e entrada na lista de aplicativos instalados do Windows.
+- Restauração dos arquivos anteriores se a substituição ou a inicialização do serviço falhar.
+- Consulta da versão por metadados, sem executar o aplicativo instalado.
+- Processo de empacotamento com assinatura do aplicativo antes de incorporá-lo ao instalador, assinatura do instalador e verificação de ambos.
+
+O código está preparado para assinatura, mas a distribuição assinada depende de certificado ou serviço de assinatura reconhecido. Pacotes em `unsigned-development` são somente para desenvolvimento e podem ser bloqueados pelo Windows.
+
+## Alterações da versão 6.9
+
+- Restauração da barra de tarefas antes da inicialização do agente e durante os dez primeiros ciclos do timer após reiniciar o agente ou desbloquear a tela transparente.
+- Novas tentativas quando o Explorer recria a barra de tarefas.
+- Cancelamento da recuperação ao iniciar outro bloqueio transparente, respeitando a opção de ocultar a barra.
 
 ## Recursos
 
@@ -24,7 +41,7 @@ Feito por Gabriel Paz.
 - Inicialização automática com o Windows
 - Serviço de recuperação do agente
 - Limitação progressiva após tentativas incorretas
-- Instalação, atualização e desinstalação pelo mesmo executável
+- Instalador com atualização e reparação da instalação existente
 
 ## Requisitos
 
@@ -42,9 +59,13 @@ Na primeira execução:
 2. Confirme a senha.
 3. Clique em **Instalar e iniciar**.
 
-Após a instalação, o aplicativo será iniciado automaticamente com o Windows. Ao abrir o instalador novamente, será possível abrir as configurações, atualizar ou desinstalar a versão existente.
+Após a instalação, o aplicativo será iniciado automaticamente com o Windows. Ao abrir o instalador novamente, será possível abrir as configurações, atualizar, reparar ou desinstalar a versão existente.
 
-Para atualizar uma instalação anterior, abra o instalador 6.8 da mesma arquitetura e escolha **Atualizar**.
+Para atualizar uma instalação anterior, abra o instalador 7.0 da mesma arquitetura e escolha **Atualizar versão**. **Reparar instalação** recupera o aplicativo, o serviço e os atalhos sem solicitar nova senha. A configuração precisa estar presente e válida; um arquivo inválido não é sobrescrito.
+
+O instalador também fica em `Program Files\Bloqueio Transparente\Installer`. A desinstalação mantém a configuração protegida para uma futura reinstalação. Arquivos em uso podem ser removidos na próxima reinicialização.
+
+Instruções de compilação, assinatura e validação: [Instalador e assinatura](docs/instalador-assinatura.md).
 
 ## Uso
 

@@ -1,10 +1,15 @@
 [package]
 name = "bloqueio-transparente"
-version = "0.6.8"
+version = "0.7.0"
 edition = "2024"
 authors = ["Gabriel Paz"]
 description = "Bloqueio transparente de teclado e mouse para Windows"
 license = "MIT"
+
+[workspace]
+members = ["installer"]
+default-members = ["."]
+resolver = "3"
 
 [lib]
 name = "bloqueio_transparente"

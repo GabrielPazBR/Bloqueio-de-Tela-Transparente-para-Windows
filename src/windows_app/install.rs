@@ -36,44 +36,174 @@ pub fn install() -> Result<()> {
     Ok(())
 }
 
+static PAYLOAD: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
+
+pub(super) fn set_payload(payload: &'static [u8]) -> Result<()> {
+    if !payload.starts_with(b"MZ") {
+        bail!("o pacote não contém um aplicativo Windows válido");
+    }
+    PAYLOAD
+        .set(payload)
+        .map_err(|_| anyhow::anyhow!("pacote já inicializado"))
+}
+
+fn payload() -> Result<&'static [u8]> {
+    PAYLOAD
+        .get()
+        .copied()
+        .context("execute o instalador dedicado para instalar ou reparar o aplicativo")
+}
+
 pub fn install_with_password(password: &str, shortcuts: ShortcutOptions) -> Result<()> {
+    apply_package(Some(password), shortcuts)
+}
+
+fn apply_package(password: Option<&str>, shortcuts: ShortcutOptions) -> Result<()> {
+    let _operation = OperationGuard::acquire()?;
+    let bytes = payload()?;
     let target = installed_executable()?;
-    let target_directory = target.parent().context("destino de instalação inválido")?;
     let config = config_path()?;
-    if target.exists() || config.exists() {
-        bail!("já existe uma instalação ou configuração de {DISPLAY_NAME}");
+    let fresh = password.is_some();
+    if fresh && (target.exists() || config.exists()) {
+        bail!("já existe uma instalação ou configuração; use Atualizar ou Reparar");
     }
-
-    std::fs::create_dir_all(target_directory)
-        .context("não foi possível criar o diretório em Program Files")?;
+    if !fresh {
+        ConfigStore::new(config.clone())
+            .load()
+            .context("a configuração existente não pôde ser lida; os dados foram preservados")?;
+        if let Some(version) = installed_version()
+            && crate::package::is_downgrade(&version, env!("CARGO_PKG_VERSION"))
+        {
+            bail!(
+                "há uma versão mais recente instalada ({version}); use um instalador dessa versão ou posterior"
+            );
+        }
+    }
     let current = std::env::current_exe()?;
-    std::fs::copy(&current, &target).context("não foi possível copiar o executável")?;
-    let store = ConfigStore::new(config.clone());
-    if let Err(error) = store.initialize(password, Hotkey::default()) {
-        let _ = std::fs::remove_file(&target);
-        return Err(error.into());
+    let cached = cached_installer()?;
+    // Read the package before stopping a working installation.
+    let installer = std::fs::read(&current).context("não foi possível ler o instalador")?;
+    let manager = ServiceManager::local_computer(
+        None::<&str>,
+        ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
+    )?;
+    let existing = open_optional_service(&manager)?;
+    let original_config = existing
+        .as_ref()
+        .map(|service| service.query_config())
+        .transpose()?;
+    let was_running = existing
+        .as_ref()
+        .map(|service| service.query_status())
+        .transpose()?
+        .is_some_and(|status| status.current_state != ServiceState::Stopped);
+    if fresh && existing.is_some() {
+        bail!("o serviço já existe; use Reparar instalação");
     }
-    if let Some(directory) = config.parent()
-        && let Err(error) = ipc::protect_config_file(directory)
-    {
-        let _ = std::fs::remove_file(&target);
-        let _ = std::fs::remove_file(&config);
-        return Err(error.context("não foi possível proteger o diretório de configuração"));
-    }
-    if let Err(error) = ipc::protect_config_file(&config) {
-        let _ = std::fs::remove_file(&target);
-        let _ = std::fs::remove_file(&config);
-        return Err(error.context("não foi possível proteger o arquivo de configuração"));
+    if let Some(service) = &existing {
+        stop_service(service)?;
     }
 
-    let result = create_and_start_service(&target);
-    if let Err(error) = result {
-        let _ = std::fs::remove_file(&target);
-        let _ = std::fs::remove_file(&config);
-        return Err(error);
+    let mut files = crate::package::FileTransaction::default();
+    let mut service = existing;
+    let mut created_service = false;
+    let mut configuration_created = false;
+    let result = (|| -> Result<super::package_registration::Registration> {
+        files
+            .replace(&target, bytes)
+            .context("não foi possível instalar o aplicativo")?;
+        if current != cached {
+            files
+                .replace(&cached, &installer)
+                .context("não foi possível guardar o instalador para reparação")?;
+        }
+        if let Some(password) = password {
+            let directory = config
+                .parent()
+                .context("diretório de configuração inválido")?;
+            std::fs::create_dir_all(directory)?;
+            ipc::protect_config_file(directory)?;
+            ConfigStore::new(config.clone()).initialize(password, Hotkey::default())?;
+            configuration_created = true;
+            ipc::protect_config_file(&config)?;
+        }
+        if shortcuts.start_menu {
+            files.track(&start_menu_entry()?)?;
+        }
+        if shortcuts.desktop {
+            files.track(&desktop_entry()?)?;
+        }
+        create_requested_shortcuts(&target, shortcuts)?;
+        let legacy = legacy_start_menu_entry()?;
+        if legacy.is_file() {
+            files.track(&legacy)?;
+            std::fs::remove_file(&legacy)?;
+        }
+        if service.is_none() {
+            service = Some(
+                manager.create_service(&service_information(&target), ServiceAccess::ALL_ACCESS)?,
+            );
+            created_service = true;
+        }
+        let service = service.as_ref().context("serviço indisponível")?;
+        set_service_command(
+            service,
+            &service_command(&target),
+            ServiceStartType::AutoStart,
+        )?;
+        start_service(service).context(
+            "o Windows não iniciou o aplicativo; confira os eventos de Controle de Aplicativo",
+        )?;
+        register_installation(&target, &cached)
+    })();
+    match result {
+        Ok(registration) => {
+            files.commit();
+            registration.commit();
+            Ok(())
+        }
+        Err(error) => {
+            let mut rollback_errors = Vec::new();
+            // A running process must release the replacement before rollback.
+            if let Some(service) = &service {
+                if let Err(failure) = stop_service(service) {
+                    rollback_errors.push(failure.to_string());
+                }
+                if created_service {
+                    if let Err(failure) = service.delete() {
+                        rollback_errors.push(failure.to_string());
+                    }
+                } else if let Some(previous) = &original_config
+                    && let Err(failure) = set_service_command(
+                        service,
+                        previous.executable_path.as_os_str(),
+                        previous.start_type,
+                    )
+                {
+                    rollback_errors.push(failure.to_string());
+                }
+            }
+            if let Err(failure) = files.rollback() {
+                rollback_errors.push(failure.to_string());
+            }
+            if configuration_created && let Err(failure) = std::fs::remove_file(&config) {
+                rollback_errors.push(failure.to_string());
+            }
+            if was_running
+                && let Some(service) = &service
+                && let Err(failure) = start_service(service)
+            {
+                rollback_errors.push(format!("reinício da versão anterior: {failure}"));
+            }
+            if !rollback_errors.is_empty() {
+                bail!(
+                    "{error:#}. Falhas ao restaurar a instalação anterior: {}",
+                    rollback_errors.join("; ")
+                );
+            }
+            Err(error.context("a operação falhou; os arquivos anteriores foram restaurados"))
+        }
     }
-    create_requested_shortcuts(&target, shortcuts)?;
-    Ok(())
 }
 
 pub fn installation_files() -> (bool, bool) {
@@ -84,21 +214,55 @@ pub fn installation_files() -> (bool, bool) {
 }
 
 pub fn installed_version() -> Option<String> {
-    let executable = installed_executable().ok()?;
-    let output = std::process::Command::new(executable)
-        .arg("--app-version")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let version = String::from_utf8(output.stdout).ok()?;
-    let version = version.trim();
-    (!version.is_empty()).then(|| version.to_owned())
+    file_version(&installed_executable().ok()?)
 }
 
-pub fn request_elevated_setup() -> Result<()> {
-    request_elevated("--setup", SW_SHOWNORMAL)
+fn file_version(path: &std::path::Path) -> Option<String> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VS_FIXEDFILEINFO, VerQueryValueW,
+    };
+    let path = wide_os(path.as_os_str());
+    unsafe {
+        let size = GetFileVersionInfoSizeW(path.as_ptr(), std::ptr::null_mut());
+        if size == 0 {
+            return None;
+        }
+        let mut data = vec![0_u8; size as usize];
+        if GetFileVersionInfoW(path.as_ptr(), 0, size, data.as_mut_ptr().cast()) == 0 {
+            return None;
+        }
+        let mut info = std::ptr::null_mut();
+        let mut length = 0;
+        if VerQueryValueW(
+            data.as_ptr().cast(),
+            wide("\\").as_ptr(),
+            &mut info,
+            &mut length,
+        ) == 0
+            || info.is_null()
+            || length < std::mem::size_of::<VS_FIXEDFILEINFO>() as u32
+        {
+            return None;
+        }
+        let info = std::ptr::read_unaligned(info.cast::<VS_FIXEDFILEINFO>());
+        if info.dwSignature != 0xfeef04bd {
+            return None;
+        }
+        Some(format!(
+            "{}.{}.{}",
+            info.dwFileVersionMS >> 16,
+            info.dwFileVersionMS & 0xffff,
+            info.dwFileVersionLS >> 16
+        ))
+    }
+}
+
+pub fn launch_cached_installer(command: &str) -> Result<()> {
+    let installer = cached_installer()?;
+    if !installer.is_file() {
+        bail!("o instalador de manutenção não foi encontrado; baixe e abra o instalador completo");
+    }
+    launch_elevated(&installer, command, SW_SHOWNORMAL)
 }
 
 pub fn request_elevated_repair() -> Result<()> {
@@ -114,11 +278,7 @@ pub fn request_elevated_uninstall() -> Result<()> {
 }
 
 pub fn request_settings() -> Result<()> {
-    std::process::Command::new(std::env::current_exe()?)
-        .arg("settings")
-        .spawn()
-        .context("não foi possível abrir as configurações")?;
-    Ok(())
+    open_installed_settings()
 }
 
 pub(super) fn open_installed_settings() -> Result<()> {
@@ -131,8 +291,14 @@ pub(super) fn open_installed_settings() -> Result<()> {
 }
 
 fn request_elevated(command: &str, show_window: SHOW_WINDOW_CMD) -> Result<()> {
-    super::settings_window::hide_console();
-    let executable = std::env::current_exe()?;
+    launch_elevated(&std::env::current_exe()?, command, show_window)
+}
+
+fn launch_elevated(
+    executable: &std::path::Path,
+    command: &str,
+    show_window: SHOW_WINDOW_CMD,
+) -> Result<()> {
     let operation = wide("runas");
     let executable = wide_os(executable.as_os_str());
     let parameters = wide(command);
@@ -147,77 +313,23 @@ fn request_elevated(command: &str, show_window: SHOW_WINDOW_CMD) -> Result<()> {
         )
     };
     if result as isize <= 32 {
-        bail!("a configuração inicial foi cancelada ou não pôde ser elevada");
+        bail!("a operação foi cancelada ou não pôde ser elevada");
     }
     Ok(())
 }
 
 pub fn repair() -> Result<()> {
-    let target = installed_executable()?;
-    let config = config_path()?;
-    if !config.is_file() {
-        bail!("a configuração protegida não foi encontrada; a restauração foi cancelada");
-    }
-
-    let manager = ServiceManager::local_computer(
-        None::<&str>,
-        ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
+    apply_package(
+        None,
+        ShortcutOptions {
+            start_menu: true,
+            desktop: desktop_entry().is_ok_and(|entry| entry.is_file()),
+        },
     )
-    .context("não foi possível abrir o Gerenciador de Serviços")?;
-    let existing = manager
-        .open_service(
-            SERVICE_NAME,
-            ServiceAccess::START | ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
-        )
-        .ok();
-    if let Some(service) = &existing
-        && service.query_status()?.current_state != ServiceState::Stopped
-    {
-        let _ = service.stop();
-        for _ in 0..40 {
-            if service.query_status()?.current_state == ServiceState::Stopped {
-                break;
-            }
-            thread::sleep(Duration::from_millis(250));
-        }
-        if service.query_status()?.current_state != ServiceState::Stopped {
-            bail!("não foi possível parar o serviço para restaurar a instalação");
-        }
-    }
-
-    let current = std::env::current_exe()?;
-    let legacy_entry = legacy_start_menu_entry()?;
-    let desktop_exists = desktop_entry().is_ok_and(|entry| entry.is_file());
-    if current != target && current != legacy_entry {
-        if let Some(directory) = target.parent() {
-            std::fs::create_dir_all(directory)?;
-        }
-        std::fs::copy(&current, &target)
-            .context("não foi possível restaurar o executável instalado")?;
-    }
-    create_start_menu_entry(&target)?;
-    let _ = std::fs::remove_file(&legacy_entry);
-    if desktop_exists {
-        create_desktop_entry(&target)?;
-    }
-
-    if let Some(service) = existing {
-        service
-            .start::<&OsStr>(&[])
-            .context("os arquivos foram restaurados, mas o serviço não iniciou")?;
-    } else {
-        create_and_start_service(&target)?;
-    }
-    Ok(())
 }
 
-fn create_and_start_service(target: &std::path::Path) -> Result<()> {
-    let manager = ServiceManager::local_computer(
-        None::<&str>,
-        ServiceManagerAccess::CREATE_SERVICE | ServiceManagerAccess::CONNECT,
-    )
-    .context("acesso negado ao Gerenciador de Serviços; use um terminal como administrador")?;
-    let information = ServiceInfo {
+fn service_information(target: &std::path::Path) -> ServiceInfo {
+    ServiceInfo {
         name: OsString::from(SERVICE_NAME),
         display_name: OsString::from(DISPLAY_NAME),
         service_type: ServiceType::OWN_PROCESS,
@@ -228,63 +340,239 @@ fn create_and_start_service(target: &std::path::Path) -> Result<()> {
         dependencies: vec![],
         account_name: None,
         account_password: None,
-    };
-    let service = manager
-        .create_service(&information, ServiceAccess::ALL_ACCESS)
-        .context("não foi possível criar o serviço")?;
-    if let Err(error) = service.start::<&OsStr>(&[]) {
-        let _ = service.delete();
-        return Err(error).context("não foi possível iniciar o serviço");
+    }
+}
+
+fn open_optional_service(
+    manager: &ServiceManager,
+) -> Result<Option<windows_service::service::Service>> {
+    match manager.open_service(SERVICE_NAME, ServiceAccess::ALL_ACCESS) {
+        Ok(service) => Ok(Some(service)),
+        Err(windows_service::Error::Winapi(error)) if error.raw_os_error() == Some(1060) => {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn stop_service(service: &windows_service::service::Service) -> Result<()> {
+    let state = service.query_status()?.current_state;
+    if state == ServiceState::Stopped {
+        return Ok(());
+    }
+    if state != ServiceState::StopPending {
+        service.stop()?;
+    }
+    for _ in 0..80 {
+        if service.query_status()?.current_state == ServiceState::Stopped {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    bail!("o serviço não parou; os arquivos em uso não serão substituídos")
+}
+
+fn start_service(service: &windows_service::service::Service) -> Result<()> {
+    if service.query_status()?.current_state == ServiceState::Running {
+        return Ok(());
+    }
+    service.start::<&OsStr>(&[])?;
+    for _ in 0..80 {
+        let status = service.query_status()?;
+        if status.current_state == ServiceState::Running {
+            return Ok(());
+        }
+        if status.current_state == ServiceState::Stopped {
+            bail!(
+                "o serviço encerrou durante a inicialização: {:?}",
+                status.exit_code
+            );
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    bail!("o serviço não confirmou a inicialização")
+}
+
+fn service_command(target: &std::path::Path) -> OsString {
+    let mut command = OsString::from("\"");
+    command.push(target.as_os_str());
+    command.push("\" --service");
+    command
+}
+
+fn set_service_command(
+    service: &windows_service::service::Service,
+    command: &OsStr,
+    start_type: ServiceStartType,
+) -> Result<()> {
+    use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHANGE};
+    let command = wide_os(command);
+    if unsafe {
+        ChangeServiceConfigW(
+            service.raw_handle(),
+            SERVICE_NO_CHANGE,
+            start_type.to_raw(),
+            SERVICE_NO_CHANGE,
+            command.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error()).context("não foi possível reparar o serviço");
     }
     Ok(())
 }
 
-pub fn uninstall() -> Result<()> {
-    let _ = super::service::restore_win_l_for_current_user();
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-        .context("não foi possível abrir o Gerenciador de Serviços")?;
-    let service = manager
-        .open_service(
-            SERVICE_NAME,
-            ServiceAccess::STOP | ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS,
-        )
-        .context("serviço não encontrado")?;
-    if service.query_status()?.current_state != ServiceState::Stopped {
-        let _ = service.stop();
-        for _ in 0..20 {
-            if service.query_status()?.current_state == ServiceState::Stopped {
-                break;
-            }
-            thread::sleep(Duration::from_millis(250));
+fn cached_installer() -> Result<PathBuf> {
+    Ok(installed_executable()?
+        .parent()
+        .context("destino inválido")?
+        .join("Installer")
+        .join(format!(
+            "BloqueioTransparente-Setup-{}.exe",
+            env!("CARGO_PKG_VERSION")
+        )))
+}
+
+fn register_installation(
+    target: &std::path::Path,
+    cached: &std::path::Path,
+) -> Result<super::package_registration::Registration> {
+    let mut registration = super::package_registration::Registration::open()?;
+    let result = (|| -> Result<()> {
+        registration.text("DisplayName", DISPLAY_NAME)?;
+        registration.text("DisplayVersion", env!("CARGO_PKG_VERSION"))?;
+        registration.text("Publisher", "Gabriel Paz")?;
+        registration.text(
+            "InstallLocation",
+            &target
+                .parent()
+                .context("destino inválido")?
+                .to_string_lossy(),
+        )?;
+        registration.text("DisplayIcon", &format!("\"{}\",0", target.display()))?;
+        registration.text("ModifyPath", &format!("\"{}\"", cached.display()))?;
+        registration.text(
+            "UninstallString",
+            &format!("\"{}\" --uninstall", cached.display()),
+        )?;
+        registration.number("NoModify", 0)?;
+        registration.number("NoRepair", 0)?;
+        registration.number("WindowsInstaller", 0)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        if let Err(rollback) = registration.rollback() {
+            bail!("{error:#}; {rollback:#}");
         }
+        return Err(error);
     }
-    service
-        .delete()
-        .context("não foi possível remover o serviço")?;
-    let target = installed_executable()?;
-    let config = config_path()?;
-    let _ = std::fs::remove_file(start_menu_entry()?);
-    let _ = std::fs::remove_file(legacy_start_menu_entry()?);
-    if let Ok(entry) = desktop_entry() {
-        let _ = std::fs::remove_file(entry);
-    }
-    let _ = std::fs::remove_file(&config);
-    if std::fs::remove_file(&target).is_err() && target.exists() {
-        let target_wide = wide_os(target.as_os_str());
-        if unsafe {
-            MoveFileExW(
-                target_wide.as_ptr(),
+    Ok(registration)
+}
+
+struct OperationGuard(windows_sys::Win32::Foundation::HANDLE);
+impl OperationGuard {
+    fn acquire() -> Result<Self> {
+        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
+        use windows_sys::Win32::System::Threading::CreateMutexW;
+        let handle = unsafe {
+            CreateMutexW(
                 std::ptr::null(),
-                MOVEFILE_DELAY_UNTIL_REBOOT,
+                1,
+                wide(r"Global\BloqueioTransparente.Install").as_ptr(),
             )
-        } == 0
-        {
-            bail!("o serviço foi removido, mas o executável não pôde ser agendado para exclusão");
+        };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            unsafe { CloseHandle(handle) };
+            bail!("outra instalação ou reparação já está em andamento");
+        }
+        Ok(Self(handle))
+    }
+}
+impl Drop for OperationGuard {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::System::Threading::ReleaseMutex(self.0);
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
         }
     }
-    println!(
-        "{DISPLAY_NAME} foi removido. O executável pode desaparecer após reiniciar o Windows."
-    );
+}
+
+pub fn uninstall() -> Result<()> {
+    let _operation = OperationGuard::acquire()?;
+    let _ = super::service::restore_win_l_for_current_user();
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    if let Some(service) = open_optional_service(&manager)? {
+        stop_service(&service)?;
+        service.delete()?;
+    }
+    for entry in [start_menu_entry()?, legacy_start_menu_entry()?] {
+        remove_or_schedule(&entry)?;
+    }
+    if let Ok(entry) = desktop_entry() {
+        remove_or_schedule(&entry)?;
+    }
+    let target = installed_executable()?;
+    remove_or_schedule(&target)?;
+    let cache = cached_installer()?
+        .parent()
+        .context("diretório inválido")?
+        .to_owned();
+    if cache.is_dir() {
+        for entry in std::fs::read_dir(&cache)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if entry.file_type()?.is_file()
+                && name.starts_with("BloqueioTransparente-Setup-")
+                && name.ends_with(".exe")
+            {
+                remove_or_schedule(&entry.path())?;
+            }
+        }
+    }
+    super::package_registration::remove()?;
+    // Keep the protected configuration for reinstalling or repairing later.
+    Ok(())
+}
+
+fn remove_or_schedule(path: &std::path::Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    if std::fs::remove_file(path).is_ok() {
+        return Ok(());
+    }
+    let retired = crate::package::retire_file(path)?;
+    let retired_wide = wide_os(retired.as_os_str());
+    if unsafe {
+        MoveFileExW(
+            retired_wide.as_ptr(),
+            std::ptr::null(),
+            MOVEFILE_DELAY_UNTIL_REBOOT,
+        )
+    } == 0
+    {
+        let error = std::io::Error::last_os_error();
+        if !path.exists() {
+            let _ = std::fs::rename(&retired, path);
+        }
+        return Err(error).with_context(|| {
+            format!(
+                "não foi possível agendar a remoção; confira {} e {}",
+                path.display(),
+                retired.display()
+            )
+        });
+    }
     Ok(())
 }
 
@@ -334,31 +622,57 @@ fn report_response(response: ServiceResponse) -> Result<()> {
 }
 
 fn installed_executable() -> Result<PathBuf> {
-    let root = std::env::var_os("ProgramFiles").context("ProgramFiles não definido")?;
-    Ok(PathBuf::from(root)
-        .join(DISPLAY_NAME)
+    use windows::Win32::UI::Shell::{
+        FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX64, FOLDERID_ProgramFilesX86,
+    };
+    let root = super::known_folder(&FOLDERID_ProgramFiles)?;
+    let mut roots = vec![root.clone()];
+    for id in [FOLDERID_ProgramFilesX64, FOLDERID_ProgramFilesX86] {
+        if let Ok(path) = super::known_folder(&id)
+            && !roots.contains(&path)
+        {
+            roots.push(path);
+        }
+    }
+    let existing: Vec<_> = roots
+        .into_iter()
+        .map(|root| root.join(DISPLAY_NAME))
+        .filter(|directory| {
+            directory.join("BloqueioTransparente.exe").exists()
+                || directory.join("Installer").is_dir()
+        })
+        .collect();
+    if existing.len() > 1 {
+        bail!(
+            "há instalações em mais de uma pasta Program Files; remova a instalação duplicada antes de continuar"
+        );
+    }
+    Ok(existing
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| root.join(DISPLAY_NAME))
         .join("BloqueioTransparente.exe"))
 }
 
 fn start_menu_entry() -> Result<PathBuf> {
-    let root = std::env::var_os("ProgramData").context("ProgramData nÃ£o definido")?;
-    Ok(crate::deployment::start_menu_entry(std::path::Path::new(
-        &root,
-    )))
+    Ok(
+        super::known_folder(&windows::Win32::UI::Shell::FOLDERID_CommonPrograms)?
+            .join("Bloqueio Transparente.lnk"),
+    )
 }
 
 fn legacy_start_menu_entry() -> Result<PathBuf> {
-    let root = std::env::var_os("ProgramData").context("ProgramData não definido")?;
-    Ok(crate::deployment::legacy_start_menu_entry(
-        std::path::Path::new(&root),
-    ))
+    Ok(
+        super::known_folder(&windows::Win32::UI::Shell::FOLDERID_CommonPrograms)?
+            .join("Bloqueio Transparente.exe"),
+    )
 }
 
 fn desktop_entry() -> Result<PathBuf> {
-    let root = std::env::var_os("USERPROFILE").context("USERPROFILE não definido")?;
-    Ok(crate::deployment::desktop_entry(std::path::Path::new(
-        &root,
-    )))
+    Ok(
+        super::known_folder(&windows::Win32::UI::Shell::FOLDERID_Desktop)?
+            .join("Bloqueio Transparente.lnk"),
+    )
 }
 
 fn create_start_menu_entry(target: &std::path::Path) -> Result<()> {
@@ -444,6 +758,10 @@ pub fn run_elevated_operation(operation: ElevatedOperation) -> Result<()> {
     };
     show_result_message(&message, flags);
     result
+}
+
+pub(super) fn show_error(message: &str) {
+    show_result_message(message, MB_OK | MB_ICONERROR);
 }
 
 fn show_result_message(

@@ -15,6 +15,23 @@ fn main() {
         .set("ProductVersion", env!("CARGO_PKG_VERSION"))
         .set("ProductName", "Bloqueio Transparente")
         .set("LegalCopyright", "Feito por Gabriel Paz");
+    if std::env::var("CARGO_PKG_NAME").as_deref() == Ok("bloqueio-transparente-installer") {
+        let payload = std::env::var("BT_APP_PAYLOAD")
+            .expect("BT_APP_PAYLOAD deve apontar para o aplicativo preparado para empacotamento");
+        let payload = std::fs::canonicalize(payload).expect("aplicativo do pacote não encontrado");
+        println!("cargo:rerun-if-env-changed=BT_APP_PAYLOAD");
+        println!("cargo:rerun-if-changed={}", payload.display());
+        println!("cargo:rerun-if-changed=../build.rs");
+        println!("cargo:rustc-env=BT_APP_PAYLOAD={}", payload.display());
+        resource.set("FileDescription", "Instalador do Bloqueio Transparente");
+        resource.set_manifest(
+            r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3"><security><requestedPrivileges>
+    <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+  </requestedPrivileges></security></trustInfo>
+</assembly>"#,
+        );
+    }
     if cfg!(windows) {
         resource.compile().expect("falha ao incorporar o ícone");
     } else {

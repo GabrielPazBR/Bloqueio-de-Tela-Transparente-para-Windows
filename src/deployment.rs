@@ -40,7 +40,10 @@ pub fn maintenance_actions(
     current_version: &str,
 ) -> Vec<MaintenanceAction> {
     let mut actions = vec![MaintenanceAction::OpenSettings];
-    if installed_version != Some(current_version) {
+    if installed_version != Some(current_version)
+        && !installed_version
+            .is_some_and(|installed| crate::package::is_downgrade(installed, current_version))
+    {
         actions.push(MaintenanceAction::Update);
     }
     actions.extend([MaintenanceAction::Repair, MaintenanceAction::Uninstall]);

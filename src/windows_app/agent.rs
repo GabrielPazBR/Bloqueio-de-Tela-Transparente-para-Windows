@@ -71,6 +71,7 @@ struct AgentRuntime {
     unlock_logo_path: Option<String>,
     hide_taskbar_on_lock: bool,
     hidden_taskbars: Vec<HWND>,
+    taskbar_recovery: crate::taskbar_recovery::TaskbarRecovery,
 }
 
 // Os HWND pertencem à thread de UI. O mutex existe apenas para permitir que os
@@ -94,6 +95,9 @@ impl Drop for HookThread {
 }
 
 pub fn run(start_locked: bool) -> Result<()> {
+    // O serviço encerra o agente anterior sem executar sua limpeza. Recupere
+    // o Explorer antes das etapas de inicialização que podem falhar.
+    show_all_taskbars();
     unsafe {
         let instance = GetModuleHandleW(null());
         if instance.is_null() {
@@ -164,6 +168,7 @@ pub fn run(start_locked: bool) -> Result<()> {
             unlock_logo_path: None,
             hide_taskbar_on_lock: false,
             hidden_taskbars: Vec::new(),
+            taskbar_recovery: crate::taskbar_recovery::TaskbarRecovery::default(),
         };
         RUNTIME
             .set(Mutex::new(runtime))
@@ -177,9 +182,7 @@ pub fn run(start_locked: bool) -> Result<()> {
         let _ = configure_win_l_override(false);
         refresh_win_l_setting();
         SetTimer(manager, TIMER_ID, 1000, None);
-        // Recupera a barra de tarefas caso uma instância anterior tenha sido
-        // encerrada enquanto o Windows exibia a área de trabalho segura.
-        show_all_taskbars();
+        // O timer repete a recuperação durante a transição do desktop.
         if start_locked {
             request_lock()?;
         }
@@ -270,6 +273,13 @@ unsafe extern "system" fn window_proc(
         message,
         TASKBAR_CREATED_MESSAGE.load(Ordering::Acquire),
     ) {
+        if window == MANAGER_WINDOW.load(Ordering::Acquire) as HWND
+            && !LOCKED.load(Ordering::SeqCst)
+            && let Some(runtime) = RUNTIME.get()
+            && let Ok(mut runtime) = runtime.lock()
+        {
+            runtime.taskbar_recovery = crate::taskbar_recovery::TaskbarRecovery::default();
+        }
         let _ = add_tray_icon(window);
         return 0;
     }
@@ -648,6 +658,9 @@ fn create_overlays() -> Result<()> {
     destroy_window_list(&previous);
     destroy_window_list(&previous_widgets);
     restore_taskbars(&mut runtime.hidden_taskbars);
+    // Não permita que a recuperação do desbloqueio anterior revele a barra
+    // depois que um novo bloqueio transparente já a ocultou.
+    runtime.taskbar_recovery.cancel();
     if runtime.hide_taskbar_on_lock {
         runtime.hidden_taskbars = hide_taskbars();
     }
@@ -736,6 +749,7 @@ fn destroy_overlays() {
         destroy_window_list(&runtime.widget_overlays);
         runtime.widget_overlays.clear();
         restore_taskbars(&mut runtime.hidden_taskbars);
+        runtime.taskbar_recovery = crate::taskbar_recovery::TaskbarRecovery::default();
         if !runtime.prompt.is_null() {
             unsafe { DestroyWindow(runtime.prompt) };
             runtime.prompt = null_mut();
@@ -1723,6 +1737,19 @@ fn refresh_win_l_setting() {
 }
 
 fn timer_tick() {
+    // Execute antes do IPC: a recuperação do Explorer não depende do serviço.
+    // Libere o mutex antes de chamar APIs de janelas de outro processo.
+    let mut restore = false;
+    if let Some(runtime) = RUNTIME.get()
+        && let Ok(mut runtime) = runtime.lock()
+    {
+        runtime
+            .taskbar_recovery
+            .tick(LOCKED.load(Ordering::SeqCst), || restore = true);
+    }
+    if restore {
+        show_all_taskbars();
+    }
     send_heartbeat_if_due();
     refresh_idle_timeout_if_due();
     refresh_win_l_setting();

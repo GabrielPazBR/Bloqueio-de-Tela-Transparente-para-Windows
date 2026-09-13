@@ -143,6 +143,10 @@ impl eframe::App for SetupApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_installation(ui.ctx());
         if self.installing {
+            if ui.ctx().input(|input| input.viewport().close_requested()) {
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }

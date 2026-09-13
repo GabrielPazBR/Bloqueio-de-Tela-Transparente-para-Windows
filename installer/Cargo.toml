@@ -1,0 +1,16 @@
+[package]
+name = "bloqueio-transparente-installer"
+version = "0.7.0"
+edition = "2024"
+license = "MIT"
+build = "build.rs"
+
+[[bin]]
+name = "BloqueioTransparente-Setup"
+path = "src/main.rs"
+
+[dependencies]
+bloqueio-transparente = { path = ".." }
+
+[build-dependencies]
+winres = "0.1"

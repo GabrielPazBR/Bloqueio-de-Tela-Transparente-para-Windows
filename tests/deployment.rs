@@ -56,6 +56,13 @@ fn partial_installation_never_asks_for_a_new_password() {
 }
 
 #[test]
+fn older_installer_does_not_offer_to_replace_a_newer_application() {
+    assert!(!maintenance_actions(Some("0.8.0"), "0.7.0").contains(&MaintenanceAction::Update));
+    assert!(maintenance_actions(Some("0.6.9"), "0.7.0").contains(&MaintenanceAction::Update));
+    assert!(maintenance_actions(Some("0.7.0"), "0.7.0").contains(&MaintenanceAction::Repair));
+}
+
+#[test]
 fn installation_exposes_a_start_menu_entry() {
     assert_eq!(
         start_menu_entry(Path::new(r"C:\ProgramData")),

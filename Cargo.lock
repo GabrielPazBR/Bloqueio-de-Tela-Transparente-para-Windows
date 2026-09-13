@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "bloqueio-transparente"
-version = "0.6.8"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -476,6 +476,14 @@ dependencies = [
  "windows-sys 0.60.2",
  "winres",
  "zeroize",
+]
+
+[[package]]
+name = "bloqueio-transparente-installer"
+version = "0.7.0"
+dependencies = [
+ "bloqueio-transparente",
+ "winres",
 ]
 
 [[package]]
